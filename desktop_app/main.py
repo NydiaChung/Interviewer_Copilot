@@ -31,6 +31,8 @@ class DesktopApp:
         self.loop = None
         self.ws_thread = None
         self.audio_queue = None
+        self.latest_answer_seq = 0
+        self.latest_outline_seq = 0
 
         # 2. Start Control Panel
         self.control_panel = ControlPanelUI()
@@ -42,6 +44,8 @@ class DesktopApp:
         """Called by the Control Panel when Start is clicked and context is set."""
         if self.ws_thread and self.ws_thread.is_alive():
             return
+        self.latest_answer_seq = 0
+        self.latest_outline_seq = 0
 
         # 1. Show the overlay
         self.overlay = OverlayUI()
@@ -126,6 +130,25 @@ class DesktopApp:
                             msg_type = data.get("type", "answer")
                             answer = data.get("answer", "")
                             text = data.get("text", "")
+                            raw_seq = data.get("seq", 0)
+                            try:
+                                seq = int(raw_seq or 0)
+                            except (TypeError, ValueError):
+                                seq = 0
+
+                            # 丢弃过期消息，避免旧问题答案覆盖新问题答案
+                            if msg_type == "outline":
+                                if seq and seq < self.latest_answer_seq:
+                                    continue
+                                if seq and seq < self.latest_outline_seq:
+                                    continue
+                                if seq:
+                                    self.latest_outline_seq = seq
+                            elif msg_type == "answer":
+                                if seq and seq < self.latest_answer_seq:
+                                    continue
+                                if seq:
+                                    self.latest_answer_seq = seq
 
                             # Safely update PyQt UI from the asyncio thread using Qt Signals
                             if self.overlay:

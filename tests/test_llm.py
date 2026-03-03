@@ -6,6 +6,7 @@ from server.llm import (
     OpenAIProcessor,
     DashScopeProcessor,
     GeminiProcessor,
+    FallbackLLMProcessor,
 )
 
 
@@ -33,6 +34,22 @@ def test_get_llm_processor_factory():
         with patch("google.genai.Client"):
             processor = get_llm_processor()
             assert isinstance(processor, GeminiProcessor)
+
+
+def test_get_llm_processor_auto_mode_prefers_available_chain():
+    with patch.dict(
+        os.environ,
+        {
+            "LLM_PROVIDER": "auto",
+            "LLM_AUTO_ORDER": "dashscope,openai,gemini",
+            "DASHSCOPE_API_KEY": "dash-key",
+            "OPENAI_API_KEY": "openai-key",
+        },
+        clear=True,
+    ):
+        with patch("dashscope.Generation"), patch("openai.OpenAI"):
+            processor = get_llm_processor()
+            assert isinstance(processor, FallbackLLMProcessor)
 
 
 @pytest.mark.asyncio
@@ -63,6 +80,21 @@ async def test_openai_processor_generate_answer():
             mock_openai.chat.completions.create.assert_called_once()
             args, kwargs = mock_openai.chat.completions.create.call_args
             assert "jd" in kwargs["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_openai_processor_none_content_returns_empty_string():
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}):
+        mock_openai = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = None
+        mock_openai.chat.completions.create.return_value = mock_response
+
+        with patch("openai.OpenAI", return_value=mock_openai):
+            processor = OpenAIProcessor()
+            result = await processor.generate_answer("jd", "resume", "question")
+            assert result == ""
 
 
 @pytest.mark.asyncio

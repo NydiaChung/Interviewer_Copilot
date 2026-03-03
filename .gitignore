@@ -6,6 +6,7 @@ venv/
 .venv/
 env/
 .env
+server/records/
 
 # Mac
 .DS_Store

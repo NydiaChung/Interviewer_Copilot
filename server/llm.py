@@ -2,6 +2,7 @@
 
 import os
 import asyncio
+from typing import Any, Optional, Tuple, List
 
 try:
     from server.prompt import INTERVIEW_PROMPT, OUTLINE_PROMPT, ANALYSIS_PROMPT
@@ -19,6 +20,15 @@ class BaseLLMProcessor:
 
     async def generate_analysis(self, jd: str, resume: str, history: str) -> str:
         raise NotImplementedError
+
+
+def _safe_text(value: Any) -> str:
+    """Normalize model outputs to plain string for UI and transcript storage."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
 
 
 class OpenAIProcessor(BaseLLMProcessor):
@@ -45,7 +55,7 @@ class OpenAIProcessor(BaseLLMProcessor):
             temperature=0.7,
             max_tokens=50,
         )
-        return response.choices[0].message.content.strip()
+        return _safe_text(response.choices[0].message.content)
 
     async def generate_answer(self, jd: str, resume: str, question: str) -> str:
         if not question.strip():
@@ -62,7 +72,7 @@ class OpenAIProcessor(BaseLLMProcessor):
             temperature=0.7,
             max_tokens=200,
         )
-        return response.choices[0].message.content.strip()
+        return _safe_text(response.choices[0].message.content)
 
     async def generate_analysis(self, jd: str, resume: str, history: str) -> str:
         if not history.strip():
@@ -79,7 +89,7 @@ class OpenAIProcessor(BaseLLMProcessor):
             temperature=0.7,
             max_tokens=1500,
         )
-        return response.choices[0].message.content.strip()
+        return _safe_text(response.choices[0].message.content)
 
 
 class DashScopeProcessor(BaseLLMProcessor):
@@ -110,7 +120,7 @@ class DashScopeProcessor(BaseLLMProcessor):
         )
 
         if response.status_code == 200:
-            return response.output.choices[0].message.content.strip()
+            return _safe_text(response.output.choices[0].message.content)
         else:
             print(f"[LLM] DashScope error: {response.code} - {response.message}")
             return ""
@@ -134,7 +144,7 @@ class DashScopeProcessor(BaseLLMProcessor):
         )
 
         if response.status_code == 200:
-            return response.output.choices[0].message.content.strip()
+            return _safe_text(response.output.choices[0].message.content)
         else:
             print(f"[LLM] DashScope error: {response.code} - {response.message}")
             return ""
@@ -158,7 +168,7 @@ class DashScopeProcessor(BaseLLMProcessor):
         )
 
         if response.status_code == 200:
-            return response.output.choices[0].message.content.strip()
+            return _safe_text(response.output.choices[0].message.content)
         else:
             print(f"[LLM] DashScope error: {response.code} - {response.message}")
             return "分析生成失败。"
@@ -186,7 +196,7 @@ class GeminiProcessor(BaseLLMProcessor):
             model="gemini-2.5-flash",
             contents=prompt,
         )
-        return response.text.strip()
+        return _safe_text(response.text)
 
     async def generate_answer(self, jd: str, resume: str, question: str) -> str:
         if not question.strip():
@@ -201,7 +211,7 @@ class GeminiProcessor(BaseLLMProcessor):
             model="gemini-2.5-flash",
             contents=prompt,
         )
-        return response.text.strip()
+        return _safe_text(response.text)
 
     async def generate_analysis(self, jd: str, resume: str, history: str) -> str:
         if not history.strip():
@@ -216,17 +226,111 @@ class GeminiProcessor(BaseLLMProcessor):
             model="gemini-2.5-pro",  # Pro for deeper reasoning
             contents=prompt,
         )
-        return response.text.strip()
+        return _safe_text(response.text)
+
+
+class FallbackLLMProcessor(BaseLLMProcessor):
+    """Try multiple providers sequentially at runtime when one fails."""
+
+    def __init__(self, providers: List[Tuple[str, BaseLLMProcessor]]):
+        self.providers = providers
+
+    async def _run(self, method_name: str, *args) -> str:
+        last_exc = None
+        for provider_name, processor in self.providers:
+            try:
+                method = getattr(processor, method_name)
+                result = _safe_text(await method(*args))
+                if result:
+                    return result
+                print(f"[LLM] {provider_name}.{method_name} returned empty, trying next.")
+            except Exception as e:
+                last_exc = e
+                print(f"[LLM] {provider_name}.{method_name} failed: {e}")
+        if last_exc:
+            raise last_exc
+        return ""
+
+    async def generate_outline(self, jd: str, resume: str, question: str) -> str:
+        return await self._run("generate_outline", jd, resume, question)
+
+    async def generate_answer(self, jd: str, resume: str, question: str) -> str:
+        return await self._run("generate_answer", jd, resume, question)
+
+    async def generate_analysis(self, jd: str, resume: str, history: str) -> str:
+        return await self._run("generate_analysis", jd, resume, history)
+
+
+def _build_processor(name: str) -> Optional[Tuple[str, BaseLLMProcessor]]:
+    name = (name or "").strip().lower()
+    if name == "openai":
+        if not os.getenv("OPENAI_API_KEY"):
+            return None
+        try:
+            return ("openai", OpenAIProcessor())
+        except Exception as e:
+            print(f"[LLM] openai init failed: {e}")
+            return None
+    if name == "dashscope":
+        if not os.getenv("DASHSCOPE_API_KEY"):
+            return None
+        try:
+            return ("dashscope", DashScopeProcessor())
+        except Exception as e:
+            print(f"[LLM] dashscope init failed: {e}")
+            return None
+    if name == "gemini":
+        if not os.getenv("GEMINI_API_KEY"):
+            return None
+        try:
+            return ("gemini", GeminiProcessor())
+        except Exception as e:
+            print(f"[LLM] gemini init failed: {e}")
+            return None
+    return None
+
+
+def _parse_order(raw: str) -> List[str]:
+    seen = set()
+    order = []
+    for part in (raw or "").split(","):
+        name = part.strip().lower()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        order.append(name)
+    return order
 
 
 def get_llm_processor() -> BaseLLMProcessor:
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider == "dashscope":
-        return DashScopeProcessor()
-    elif provider == "gemini":
-        return GeminiProcessor()
-    else:
-        return OpenAIProcessor()
+    provider = os.getenv("LLM_PROVIDER", "auto").lower()
+    auto_order = _parse_order(os.getenv("LLM_AUTO_ORDER", "dashscope,openai,gemini"))
+
+    if provider in {"openai", "dashscope", "gemini"}:
+        built = _build_processor(provider)
+        if not built:
+            raise ValueError(f"{provider} provider is not configured correctly")
+        return built[1]
+
+    # auto mode: build all available providers in order, and runtime-fallback across them
+    built_providers = []
+    for name in auto_order:
+        built = _build_processor(name)
+        if built:
+            built_providers.append(built)
+
+    if not built_providers:
+        raise ValueError(
+            "No available LLM provider. Please configure at least one API key."
+        )
+    if len(built_providers) == 1:
+        provider_name, processor = built_providers[0]
+        print(f"[LLM] Auto mode selected single provider: {provider_name}")
+        return processor
+
+    names = ",".join([name for name, _ in built_providers])
+    print(f"[LLM] Auto mode enabled with fallback chain: {names}")
+    return FallbackLLMProcessor(built_providers)
 
 
 # Singleton instance

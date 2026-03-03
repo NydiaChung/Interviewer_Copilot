@@ -123,6 +123,14 @@ class _FakeLLM:
         return "analysis-ok"
 
 
+class _FailingLLM(_FakeLLM):
+    async def generate_answer(self, jd: str, resume: str, question: str) -> str:
+        raise RuntimeError("answer failed")
+
+    async def generate_analysis(self, jd: str, resume: str, history: str) -> str:
+        raise RuntimeError("analysis failed")
+
+
 def test_manual_question_does_not_trigger_analysis():
     from server import main
 
@@ -177,3 +185,31 @@ def test_websocket_uses_per_connection_asr_instance():
             ws2.receive_json()
 
     assert len(factory_calls) == 2
+
+
+def test_manual_question_returns_fallback_when_llm_fails():
+    from server import main
+
+    failing_llm = _FailingLLM()
+    with patch.object(main, "llm_processor", failing_llm), patch.object(
+        main, "get_asr_processor", return_value=_FakeASR()
+    ):
+        with client.websocket_connect("/ws/audio") as ws:
+            ws.send_text(json.dumps({"command": "manual_question", "text": "你好"}))
+            response = ws.receive_json()
+            assert response["type"] == "answer"
+            assert "抱歉，我刚才没来得及生成完整回答" in response["answer"]
+
+
+def test_end_session_returns_fallback_when_analysis_fails():
+    from server import main
+
+    failing_llm = _FailingLLM()
+    with patch.object(main, "llm_processor", failing_llm), patch.object(
+        main, "get_asr_processor", return_value=_FakeASR()
+    ):
+        with client.websocket_connect("/ws/audio") as ws:
+            ws.send_text(json.dumps({"command": "end_session"}))
+            response = ws.receive_json()
+            assert response["type"] == "analysis"
+            assert "复盘生成超时或失败" in response["answer"]
