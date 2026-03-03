@@ -1,0 +1,126 @@
+/* Interview Copilot - Floating Overlay Styles */
+
+#interview-copilot-overlay {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  width: 360px;
+  max-height: 80vh;
+  background: rgba(20, 20, 30, 0.95);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  z-index: 2147483647;
+  overflow: hidden;
+  color: #fff;
+}
+
+#interview-copilot-overlay .ic-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  background: linear-gradient(90deg, rgba(0, 212, 255, 0.2), rgba(123, 44, 191, 0.2));
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  cursor: grab;
+  user-select: none;
+}
+
+#interview-copilot-overlay .ic-title {
+  font-size: 14px;
+  font-weight: 600;
+  background: linear-gradient(90deg, #00d4ff, #7b2cbf);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+#interview-copilot-overlay .ic-minimize {
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+#interview-copilot-overlay .ic-minimize:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+#interview-copilot-overlay .ic-content {
+  padding: 16px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+#interview-copilot-overlay .ic-question {
+  margin-bottom: 12px;
+}
+
+#interview-copilot-overlay .ic-label {
+  display: block;
+  font-size: 11px;
+  color: #888;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-bottom: 4px;
+}
+
+#interview-copilot-overlay .ic-question-text {
+  display: block;
+  font-size: 13px;
+  color: #00d4ff;
+  line-height: 1.4;
+}
+
+#interview-copilot-overlay .ic-divider {
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+  margin: 12px 0;
+}
+
+#interview-copilot-overlay .ic-answer-text {
+  font-size: 14px;
+  line-height: 1.6;
+  color: #fff;
+  white-space: pre-wrap;
+}
+
+#interview-copilot-overlay .ic-highlight {
+  animation: ic-pulse 0.5s ease;
+}
+
+@keyframes ic-pulse {
+  0% {
+    background: rgba(0, 212, 255, 0.2);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+/* Scrollbar */
+#interview-copilot-overlay .ic-content::-webkit-scrollbar {
+  width: 6px;
+}
+
+#interview-copilot-overlay .ic-content::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+#interview-copilot-overlay .ic-content::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 3px;
+}
+
+#interview-copilot-overlay .ic-content::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}

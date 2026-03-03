@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+websockets
+openai
+deepgram-sdk
+python-dotenv
+dashscope
+google-genai
+tavily-python
+PyMuPDF
+python-docx
+python-multipart
