@@ -28,10 +28,12 @@ print(f"[ENV] DOUBAO_APP_ID={os.getenv('DOUBAO_APP_ID', '(未设置)')}")
 
 try:
     from server.asr import get_asr_processor
+    from server.intent import IntentReadinessDetector
     from server.llm import llm_processor
 except ModuleNotFoundError:
     # Fallback for running from server/ directory directly.
     from asr import get_asr_processor
+    from intent import IntentReadinessDetector
     from llm import llm_processor
 
 app = FastAPI(title="Interview Copilot")
@@ -145,19 +147,16 @@ async def audio_websocket(websocket: WebSocket):
     session_transcript = []
 
     # State tracking per connection
-    has_generated_outline = False
-    current_sentence = ""
-    OUTLINE_CHAR_THRESHOLD = 8  # characters required to trigger early intent outline
     background_tasks = set()
+    intent_detector = IntentReadinessDetector()
+    outline_task = None
 
     # We will need the event loop for the async callback
     loop = asyncio.get_running_loop()
 
     async def on_text_update(text: str, is_sentence_end: bool):
         """Callback fired by the ASR processor when new text is recognized."""
-        nonlocal has_generated_outline, current_sentence, session_transcript
-
-        current_sentence = text
+        nonlocal session_transcript, outline_task
         # print(f"[ASR] Incremental: {text} | End: {is_sentence_end}") # Too noisy
 
         if not text:
@@ -169,34 +168,45 @@ async def audio_websocket(websocket: WebSocket):
         except:
             pass
 
-        # 1. Early Intent Outline Detection
-        # If we haven't generated an outline yet, and the text is long enough
-        if not has_generated_outline and len(text) >= OUTLINE_CHAR_THRESHOLD:
-            has_generated_outline = True
-            print("[LLM] Generating early intent outline...")
+        # 1. Early draft outline (intent-ready partial only)
+        if not is_sentence_end and intent_detector.should_trigger_outline(text):
+            print("[LLM] Intent ready. Generating draft outline...")
 
-            # Fire and forget the outline generation, so we don't block
-            async def _do_outline():
-                outline = await llm_processor.generate_outline(
-                    jd=JD_TEXT, resume=RESUME_TEXT, question=text
-                )
+            if outline_task and not outline_task.done():
+                outline_task.cancel()
+
+            async def _do_outline(question_snapshot: str):
+                try:
+                    outline = await llm_processor.generate_outline(
+                        jd=JD_TEXT, resume=RESUME_TEXT, question=question_snapshot
+                    )
+                except asyncio.CancelledError:
+                    return
                 print(f"[LLM] Outline: {outline}")
+                if not outline:
+                    return
+                draft_text = f"【要点草稿】\n{outline}"
                 try:
                     await websocket.send_json(
-                        {"type": "outline", "question": text, "answer": outline}
+                        {
+                            "type": "outline",
+                            "question": question_snapshot,
+                            "answer": draft_text,
+                        }
                     )
                 except Exception as e:
                     print(f"[WS] Error sending outline: {e}")
 
-            task = asyncio.create_task(_do_outline())
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
+            outline_task = asyncio.create_task(_do_outline(text))
+            background_tasks.add(outline_task)
+            outline_task.add_done_callback(background_tasks.discard)
 
         # 2. End of Sentence -> Full Answer
         if is_sentence_end:
             print("[LLM] Sentence complete. Generating full answer...")
-            # We reset outline flag for the next sentence
-            has_generated_outline = False
+            intent_detector.reset()
+            if outline_task and not outline_task.done():
+                outline_task.cancel()
 
             async def _do_answer():
                 nonlocal session_transcript

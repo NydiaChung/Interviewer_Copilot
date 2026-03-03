@@ -174,11 +174,11 @@ class OverlayUI(QWidget):
         if msg_type == "incremental":
             self.asr_label.setText(f"🎤 {text}")
         elif msg_type == "outline":
-            self.outline_label.setText(f"💡 {text}")
-            self.answer_label.setText("正在生成回答...")
+            self.outline_label.setText("⚡ 要点草稿（可先回答）")
+            self.answer_label.setText(text)
         elif msg_type == "answer":
             self.asr_label.setText("🎤 正在倾听...")
-            self.outline_label.setText("💡 AI 参考回答")
+            self.outline_label.setText("✅ 完整回答（定稿）")
             self.answer_label.setText(text)
         elif msg_type == "analysis":
             self.asr_label.hide()
