@@ -32,11 +32,13 @@ try:
     from server.asr import get_asr_processor
     from server.intent import IntentReadinessDetector
     from server.llm import llm_processor
+    from server.voiceprint import VoiceprintTracker
 except ModuleNotFoundError:
     # Fallback for running from server/ directory directly.
     from asr import get_asr_processor
     from intent import IntentReadinessDetector
     from llm import llm_processor
+    from voiceprint import VoiceprintTracker
 
 app = FastAPI(title="Interview Copilot")
 
@@ -57,6 +59,12 @@ LLM_ANSWER_TIMEOUT_SECONDS = 18
 LLM_ANALYSIS_TIMEOUT_SECONDS = 45
 ANSWER_FALLBACK_TEXT = "抱歉，我刚才没来得及生成完整回答。请让我复述一遍这个问题，我会马上给你一个结构化回答。"
 ANALYSIS_FALLBACK_TEXT = "本次复盘生成超时或失败，请稍后重试。"
+QUESTION_CLOSE_SILENCE_SECONDS = 0.9
+QUESTION_FORCE_CLOSE_SECONDS = 2.6
+NEW_QUESTION_SIMILARITY_THRESHOLD = 0.45
+VOICEPRINT_SWITCH_MIN_GAP_SECONDS = 0.35
+VOICEPRINT_SWITCH_SIMILARITY_THRESHOLD = 0.72
+ANSWER_STREAM_INTERVAL_SECONDS = 0.04
 
 
 def _normalize_text(text: str) -> str:
@@ -67,6 +75,44 @@ def _similarity(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
+
+
+def _is_question_like(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    hints = (
+        "?",
+        "？",
+        "吗",
+        "呢",
+        "么",
+        "如何",
+        "怎么",
+        "为什么",
+        "是否",
+        "请你",
+        "能否",
+    )
+    return any(h in t for h in hints)
+
+
+def _chunk_answer_text(text: str):
+    """Chunk answer text for incremental UI updates."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    chunks = []
+    buf = ""
+    split_chars = set("，。！？；,.!?\n")
+    for ch in text:
+        buf += ch
+        if (ch in split_chars and len(buf) >= 6) or len(buf) >= 20:
+            chunks.append(buf)
+            buf = ""
+    if buf:
+        chunks.append(buf)
+    return chunks
 
 
 class ContextInput(BaseModel):
@@ -169,12 +215,79 @@ async def audio_websocket(websocket: WebSocket):
     answer_generation_lock = asyncio.Lock()
     intent_detector = IntentReadinessDetector()
     outline_task = None
+    close_check_task = None
+    current_turn = None
+    next_turn_id = 1
     next_answer_seq = 1
-    last_final_text = ""
-    last_final_ts = 0.0
+    last_answer_trigger_text = ""
+    last_answer_trigger_ts = 0.0
+    voiceprint_tracker = VoiceprintTracker()
+    last_dominant_speaker = None
+    last_speaker_change_ts = 0.0
 
     # We will need the event loop for the async callback
     loop = asyncio.get_running_loop()
+
+    def _create_turn(
+        text: str, normalized: str, now_ts: float, speaker_id: int | None = None
+    ):
+        nonlocal next_turn_id
+        turn = {
+            "id": next_turn_id,
+            "text": text,
+            "norm": normalized,
+            "created_ts": now_ts,
+            "last_ts": now_ts,
+            "got_final": False,
+            "draft_sent": False,
+            "closed": False,
+            "speaker_id": speaker_id,
+        }
+        next_turn_id += 1
+        return turn
+
+    def _is_speaker_switched(turn: dict, incoming_speaker: int | None) -> bool:
+        turn_speaker = turn.get("speaker_id")
+        return (
+            incoming_speaker is not None
+            and turn_speaker is not None
+            and incoming_speaker != turn_speaker
+        )
+
+    def _current_dominant_speaker(now_ts: float) -> int | None:
+        speaker_id = voiceprint_tracker.dominant_speaker(now_ts)
+        if speaker_id is not None:
+            return speaker_id
+        return last_dominant_speaker
+
+    def _should_start_new_turn(
+        turn: dict, incoming_norm: str, now_ts: float, incoming_speaker: int | None
+    ) -> bool:
+        if not turn or turn.get("closed"):
+            return False
+        speaker_switched = _is_speaker_switched(turn, incoming_speaker)
+        if len(turn.get("norm", "")) < 10 or len(incoming_norm) < 6:
+            if speaker_switched and turn.get("got_final") and len(incoming_norm) >= 4:
+                return True
+            return False
+        sim = _similarity(incoming_norm, turn.get("norm", ""))
+        if sim >= NEW_QUESTION_SIMILARITY_THRESHOLD and not speaker_switched:
+            return False
+        if (
+            speaker_switched
+            and sim <= VOICEPRINT_SWITCH_SIMILARITY_THRESHOLD
+            and (now_ts - turn.get("last_ts", now_ts))
+            >= VOICEPRINT_SWITCH_MIN_GAP_SECONDS
+        ):
+            return True
+        if turn.get("got_final"):
+            return True
+        if (
+            _is_question_like(turn.get("text", ""))
+            and (now_ts - turn.get("last_ts", now_ts)) >= 0.55
+        ):
+            return True
+        return False
 
     async def _call_with_timeout(coro, timeout_seconds: int, fallback_text: str) -> str:
         try:
@@ -199,12 +312,58 @@ async def audio_websocket(websocket: WebSocket):
             )
         return history_text.strip()
 
-    def _schedule_answer(question_text: str, source: str):
+    async def _stream_answer_to_client(
+        seq: int, question_snapshot: str, answer_text: str, question_id
+    ):
+        chunks = _chunk_answer_text(answer_text)
+        if not chunks:
+            chunks = [answer_text]
+        if len(chunks) == 1:
+            await websocket.send_json(
+                {
+                    "type": "answer",
+                    "question": question_snapshot,
+                    "answer": answer_text,
+                    "seq": seq,
+                    "question_id": question_id,
+                    "streaming": False,
+                }
+            )
+            return
+
+        partial = ""
+        for chunk in chunks:
+            partial += chunk
+            await websocket.send_json(
+                {
+                    "type": "answer",
+                    "question": question_snapshot,
+                    "answer": partial,
+                    "seq": seq,
+                    "question_id": question_id,
+                    "streaming": True,
+                }
+            )
+            await asyncio.sleep(ANSWER_STREAM_INTERVAL_SECONDS)
+        await websocket.send_json(
+            {
+                "type": "answer",
+                "question": question_snapshot,
+                "answer": answer_text,
+                "seq": seq,
+                "question_id": question_id,
+                "streaming": False,
+            }
+        )
+
+    def _schedule_answer(question_text: str, source: str, question_id=None):
         nonlocal next_answer_seq
         answer_seq = next_answer_seq
         next_answer_seq += 1
 
-        async def _do_answer(seq: int, question_snapshot: str, source_snapshot: str):
+        async def _do_answer(
+            seq: int, question_snapshot: str, source_snapshot: str, qid
+        ):
             nonlocal session_transcript
             try:
                 async with answer_generation_lock:
@@ -220,56 +379,159 @@ async def audio_websocket(websocket: WebSocket):
                     {
                         "seq": seq,
                         "source": source_snapshot,
+                        "question_id": qid,
                         "面试官的问题": question_snapshot,
                         "AI参考回答": answer,
                     }
                 )
-                try:
-                    await websocket.send_json(
-                        {
-                            "type": "answer",
-                            "question": question_snapshot,
-                            "answer": answer,
-                            "seq": seq,
-                        }
-                    )
-                except Exception as e:
-                    print(f"[WS] Error sending answer: {e}")
+                await _stream_answer_to_client(seq, question_snapshot, answer, qid)
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 print(f"[LLM] 生成回答任务异常: {e}")
 
-        task = asyncio.create_task(_do_answer(answer_seq, question_text, source))
+        task = asyncio.create_task(
+            _do_answer(answer_seq, question_text, source, question_id)
+        )
         answer_tasks.add(task)
         background_tasks.add(task)
         task.add_done_callback(answer_tasks.discard)
         task.add_done_callback(background_tasks.discard)
 
+    async def _maybe_close_turn(turn_id: int, reason: str, force: bool = False) -> bool:
+        nonlocal current_turn, outline_task, last_answer_trigger_text, last_answer_trigger_ts
+        turn = current_turn
+        if not turn or turn.get("id") != turn_id or turn.get("closed"):
+            return False
+
+        now_ts = time.monotonic()
+        silence = now_ts - turn.get("last_ts", now_ts)
+        dominant_speaker = _current_dominant_speaker(now_ts)
+        speaker_switched = _is_speaker_switched(turn, dominant_speaker)
+        speaker_switched_recently = (
+            speaker_switched and (now_ts - last_speaker_change_ts) <= 1.6
+        )
+        should_close = (
+            force
+            or (
+                silence >= QUESTION_CLOSE_SILENCE_SECONDS
+                and (turn.get("got_final") or _is_question_like(turn.get("text", "")))
+            )
+            or (
+                silence >= VOICEPRINT_SWITCH_MIN_GAP_SECONDS
+                and speaker_switched_recently
+                and len(turn.get("norm", "")) >= 8
+            )
+            or silence >= QUESTION_FORCE_CLOSE_SECONDS
+        )
+        if not should_close:
+            return False
+
+        turn["closed"] = True
+        turn["close_reason"] = reason
+        intent_detector.reset()
+        if outline_task and not outline_task.done():
+            outline_task.cancel()
+
+        normalized = turn.get("norm", "")
+        if (
+            normalized
+            and _similarity(normalized, last_answer_trigger_text) >= 0.97
+            and (now_ts - last_answer_trigger_ts) <= 8
+        ):
+            print(f"[LLM] 跳过重复问题触发: {turn.get('text', '')}")
+            current_turn = None
+            return True
+
+        last_answer_trigger_text = normalized
+        last_answer_trigger_ts = now_ts
+        _schedule_answer(turn.get("text", ""), source="asr", question_id=turn.get("id"))
+        current_turn = None
+        return True
+
+    def _arm_close_check(turn_id: int):
+        nonlocal close_check_task
+        if close_check_task and not close_check_task.done():
+            close_check_task.cancel()
+
+        async def _wait_and_check():
+            try:
+                await asyncio.sleep(QUESTION_CLOSE_SILENCE_SECONDS)
+                closed = await _maybe_close_turn(turn_id, reason="silence")
+                if (
+                    not closed
+                    and current_turn
+                    and current_turn.get("id") == turn_id
+                    and not current_turn.get("closed")
+                ):
+                    _arm_close_check(turn_id)
+            except asyncio.CancelledError:
+                return
+
+        close_check_task = asyncio.create_task(_wait_and_check())
+        background_tasks.add(close_check_task)
+        close_check_task.add_done_callback(background_tasks.discard)
+
     async def on_text_update(text: str, is_sentence_end: bool):
         """Callback fired by the ASR processor when new text is recognized."""
-        nonlocal outline_task, last_final_text, last_final_ts
-        # print(f"[ASR] Incremental: {text} | End: {is_sentence_end}") # Too noisy
-
+        nonlocal current_turn, outline_task
         if not text:
             return
 
-        # 0. Send incremental text to client for real-time feedback
+        now_ts = time.monotonic()
+        normalized = _normalize_text(text)
+        incoming_speaker = _current_dominant_speaker(now_ts)
+
+        if current_turn and _should_start_new_turn(
+            current_turn, normalized, now_ts, incoming_speaker
+        ):
+            await _maybe_close_turn(
+                current_turn.get("id"), reason="next_question_start", force=True
+            )
+
+        if not current_turn:
+            current_turn = _create_turn(text, normalized, now_ts, incoming_speaker)
+        else:
+            # 只有当识别到的内容发生实质变化时，才更新计时器
+            if normalized != current_turn.get("norm"):
+                current_turn["last_ts"] = now_ts
+
+            current_turn["text"] = text
+            current_turn["norm"] = normalized
+            if current_turn.get("speaker_id") is None and incoming_speaker is not None:
+                current_turn["speaker_id"] = incoming_speaker
+
+        if is_sentence_end:
+            current_turn["got_final"] = True
+
+        # Send incremental text with question_id for debug/traceability.
         try:
-            await websocket.send_json({"type": "incremental", "text": text})
+            await websocket.send_json(
+                {
+                    "type": "incremental",
+                    "text": text,
+                    "question_id": current_turn.get("id"),
+                    "speaker_id": incoming_speaker,
+                }
+            )
         except Exception:
             pass
 
-        # 1. Early draft outline (intent-ready partial only)
-        if not is_sentence_end and intent_detector.should_trigger_outline(text):
+        # Early draft outline: one shot per question.
+        if (
+            not current_turn.get("draft_sent")
+            and not is_sentence_end
+            and intent_detector.should_trigger_outline(text)
+        ):
             print("[LLM] Intent ready. Generating draft outline...")
+            current_turn["draft_sent"] = True
+            turn_id = current_turn.get("id")
+            outline_seq = next_answer_seq
 
             if outline_task and not outline_task.done():
                 outline_task.cancel()
 
-            outline_seq = next_answer_seq
-
-            async def _do_outline(question_snapshot: str, seq: int):
+            async def _do_outline(question_snapshot: str, seq: int, qid: int):
                 try:
                     outline = await _call_with_timeout(
                         llm_processor.generate_outline(
@@ -280,8 +542,13 @@ async def audio_websocket(websocket: WebSocket):
                     )
                 except asyncio.CancelledError:
                     return
-                print(f"[LLM] Outline(seq={seq}): {outline}")
                 if not outline:
+                    return
+                if (
+                    not current_turn
+                    or current_turn.get("id") != qid
+                    or current_turn.get("closed")
+                ):
                     return
                 draft_text = f"【要点草稿】\n{outline}"
                 try:
@@ -291,35 +558,20 @@ async def audio_websocket(websocket: WebSocket):
                             "question": question_snapshot,
                             "answer": draft_text,
                             "seq": seq,
+                            "question_id": qid,
                         }
                     )
                 except Exception as e:
                     print(f"[WS] Error sending outline: {e}")
 
-            outline_task = asyncio.create_task(_do_outline(text, outline_seq))
+            outline_task = asyncio.create_task(_do_outline(text, outline_seq, turn_id))
             background_tasks.add(outline_task)
             outline_task.add_done_callback(background_tasks.discard)
 
-        # 2. End of Sentence -> Full Answer
-        if is_sentence_end:
-            normalized = _normalize_text(text)
-            now_ts = time.monotonic()
-            # ASR 可能重复发送同一句 final，做去重避免重复回答
-            if (
-                normalized
-                and _similarity(normalized, last_final_text) >= 0.97
-                and (now_ts - last_final_ts) <= 8
-            ):
-                print(f"[LLM] 跳过重复 final: {text}")
-                return
+        _arm_close_check(current_turn.get("id"))
 
-            last_final_text = normalized
-            last_final_ts = now_ts
-            print("[LLM] Sentence complete. Generating full answer...")
-            intent_detector.reset()
-            if outline_task and not outline_task.done():
-                outline_task.cancel()
-            _schedule_answer(text, source="asr")
+        if is_sentence_end:
+            await _maybe_close_turn(current_turn.get("id"), reason="asr_final")
 
     # Initialize and start ASR stream (per-connection instance; do not share globally)
     asr_processor = get_asr_processor()
@@ -339,6 +591,7 @@ async def audio_websocket(websocket: WebSocket):
             message = await websocket.receive()
             if "bytes" in message:
                 data = message["bytes"]
+                now_ts = time.monotonic()
                 _recv_count += 1
                 if _recv_count % 100 == 1:
                     print(
@@ -348,6 +601,12 @@ async def audio_websocket(websocket: WebSocket):
                 wave_file.writeframes(data)
                 # Stream to ASR
                 asr_processor.add_audio(data)
+                sid = voiceprint_tracker.update_audio(data, ts=now_ts)
+                if sid is not None:
+                    dominant = voiceprint_tracker.dominant_speaker(now_ts)
+                    if dominant is not None and dominant != last_dominant_speaker:
+                        last_dominant_speaker = dominant
+                        last_speaker_change_ts = now_ts
             elif "text" in message:
                 text_data = message["text"]
                 print(f"[WS] Received text frame: {text_data[:80]}")
@@ -361,11 +620,21 @@ async def audio_websocket(websocket: WebSocket):
                         # Stop ASR first so no more late transcripts are appended.
                         asr_processor.stop()
 
+                        if close_check_task and not close_check_task.done():
+                            close_check_task.cancel()
                         if outline_task and not outline_task.done():
                             outline_task.cancel()
+                        if current_turn and not current_turn.get("closed"):
+                            await _maybe_close_turn(
+                                current_turn.get("id"),
+                                reason="session_end",
+                                force=True,
+                            )
 
                         # 等待已触发但未完成的回答任务，确保复盘包含最新回答
-                        pending_answers = [task for task in answer_tasks if not task.done()]
+                        pending_answers = [
+                            task for task in answer_tasks if not task.done()
+                        ]
                         if pending_answers:
                             await asyncio.gather(
                                 *pending_answers, return_exceptions=True
@@ -407,9 +676,17 @@ async def audio_websocket(websocket: WebSocket):
                         manual_text = cmd_json.get("text", "").strip()
                         if manual_text:
                             print(f"[Manual] User sent: {manual_text}")
+                            if close_check_task and not close_check_task.done():
+                                close_check_task.cancel()
                             intent_detector.reset()
                             if outline_task and not outline_task.done():
                                 outline_task.cancel()
+                            if current_turn and not current_turn.get("closed"):
+                                await _maybe_close_turn(
+                                    current_turn.get("id"),
+                                    reason="manual_interrupt",
+                                    force=True,
+                                )
                             _schedule_answer(manual_text, source="manual")
 
                 except Exception as e:
