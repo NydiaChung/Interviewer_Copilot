@@ -194,6 +194,14 @@ class DoubaoProvider(ASRProvider):
                 if self._audio_count % 50 == 0:
                     print(f"[ASR-Doubao] 已发送 {self._audio_count} 帧音频")
             except asyncio.TimeoutError:
+                # Fix: 增加心跳/闲置补偿逻辑。
+                # 如果超过 1 秒没有音频进入队列，主动发送一个长度为 0 的音频帧，
+                # 告知服务端连接仍然活跃，防止触发 "waiting next packet timeout" 错误。
+                try:
+                    await ws.send(self._build_audio_frame(b"", last=False))
+                except Exception as e:
+                    print(f"[ASR-Doubao] 发送心跳帧失败: {e}")
+                    break
                 continue
             except Exception as e:
                 print(f"[ASR-Doubao] 发送失败: {e}")
@@ -246,7 +254,18 @@ class DoubaoProvider(ASRProvider):
                         continue
                     res = data.get("result", {}) or {}
                     text = res.get("text", "")
-                    end = bool(res.get("definite") or res.get("is_final"))
+                    # Fix 1 修正: 豆包累积 utterances 中历史句子 definite 永远为 True。
+                    # 只检查「最后一个 utterance」的 definite，它代表当前最新捕捉到的句子
+                    # 是否已由 ASR 确认（不再可能被撤回修改）。
+                    utterances = res.get("utterances") or []
+                    if utterances:
+                        # 最后一个 utterance 的 definite 代表当前句子是否结束
+                        end = bool(utterances[-1].get("definite")) or bool(
+                            res.get("is_final")
+                        )
+                    else:
+                        end = bool(res.get("is_final"))
+
                     if text:
                         if self.on_text_update and self.loop:
                             asyncio.run_coroutine_threadsafe(

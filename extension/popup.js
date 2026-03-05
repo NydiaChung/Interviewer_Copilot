@@ -5,15 +5,17 @@ const SERVER_URL = 'http://localhost:8000';
 // DOM Elements
 const jdInput = document.getElementById('jd');
 const resumeInput = document.getElementById('resume');
+const dualChannelInput = document.getElementById('enableDualChannelAudio');
 const saveBtn = document.getElementById('saveBtn');
 const captureBtn = document.getElementById('captureBtn');
 const statusDiv = document.getElementById('status');
 
 // Load saved context on popup open
 document.addEventListener('DOMContentLoaded', async () => {
-  const data = await chrome.storage.local.get(['jd', 'resume', 'isCapturing']);
+  const data = await chrome.storage.local.get(['jd', 'resume', 'isCapturing', 'enableDualChannelAudio']);
   if (data.jd) jdInput.value = data.jd;
   if (data.resume) resumeInput.value = data.resume;
+  if (data.enableDualChannelAudio) dualChannelInput.checked = data.enableDualChannelAudio;
   
   updateCaptureButton(data.isCapturing || false);
 });
@@ -22,6 +24,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 saveBtn.addEventListener('click', async () => {
   const jd = jdInput.value.trim();
   const resume = resumeInput.value.trim();
+  const enableDualChannelAudio = dualChannelInput.checked;
   
   if (!jd || !resume) {
     showStatus('请填写 JD 和简历', 'error');
@@ -30,7 +33,7 @@ saveBtn.addEventListener('click', async () => {
   
   try {
     // Save to chrome.storage
-    await chrome.storage.local.set({ jd, resume });
+    await chrome.storage.local.set({ jd, resume, enableDualChannelAudio });
     
     // Send to server
     const response = await fetch(`${SERVER_URL}/set_context`, {

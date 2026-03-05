@@ -116,8 +116,17 @@
   </div>
   
   <div class="form-group">
-    <label for="resume">个人简历</label>
-    <textarea id="resume" placeholder="粘贴个人简历..."></textarea>
+    <label for="resume">简历信息：</label>
+    <textarea id="resume" placeholder="粘贴你的简历文本..." rows="6"></textarea>
+  </div>
+
+  <!-- 新增：双通道选项 -->
+  <div class="form-group checkbox-group">
+    <input type="checkbox" id="enableDualChannelAudio" />
+    <label for="enableDualChannelAudio">启用双通道分离采集 (Beta)</label>
+    <div style="font-size: 11px; color: #888; margin-left: 20px;">
+      面试官(网页)与你(麦克风)声音分离，避免大模型被干扰。
+    </div>
   </div>
   
   <div class="btn-group">

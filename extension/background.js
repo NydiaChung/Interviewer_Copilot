@@ -2,10 +2,14 @@
 
 const WS_URL = 'ws://localhost:8000/ws/audio';
 
-let mediaStream = null;
-let audioContext = null;
-let scriptProcessor = null;
+let tabMediaStream = null;
+let micMediaStream = null;
+let tabAudioContext = null;
+let micAudioContext = null;
+let tabScriptProcessor = null;
+let micScriptProcessor = null;
 let ws = null;
+let isDualChannel = false;
 
 // Handle messages from popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -30,6 +34,9 @@ chrome.commands.onCommand.addListener((command) => {
 
 async function startCapture() {
     try {
+        const data = await chrome.storage.local.get(['enableDualChannelAudio']);
+        isDualChannel = data.enableDualChannelAudio || false;
+
         // Get current tab
         const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
 
@@ -38,8 +45,6 @@ async function startCapture() {
             targetTabId: tab.id
         });
 
-        // Create media stream using offscreen document or direct capture
-        // For MV3, we need to use offscreen document for audio processing
         await setupAudioCapture(streamId, tab.id);
 
     } catch (error) {
@@ -53,17 +58,29 @@ async function setupAudioCapture(streamId, tabId) {
     ws = new WebSocket(WS_URL);
 
     ws.onopen = () => {
-        console.log('[WS] Connected to server');
+        console.log('[WS] Connected to server, DualChannel:', isDualChannel);
     };
 
     ws.onmessage = (event) => {
-        const data = JSON.parse(event.data);
-        // Send answer to content script
-        chrome.tabs.sendMessage(tabId, {
-            action: 'showAnswer',
-            question: data.question,
-            answer: data.answer
-        });
+        // 兼容后端返回纯文本或者 JSON
+        try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'answer' || data.type === 'outline') {
+                chrome.tabs.sendMessage(tabId, {
+                    action: 'showAnswer',
+                    question: data.question,
+                    answer: data.answer
+                });
+            } else if (data.answer) {
+                chrome.tabs.sendMessage(tabId, {
+                    action: 'showAnswer',
+                    question: data.question,
+                    answer: data.answer
+                });
+            }
+        } catch (e) {
+            // ignore non-json messages for UI
+        }
     };
 
     ws.onerror = (error) => {
@@ -74,9 +91,9 @@ async function setupAudioCapture(streamId, tabId) {
         console.log('[WS] Disconnected');
     };
 
-    // Get user media with the stream ID
     try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({
+        // 1. 获取 Tab Audio (面试官)
+        tabMediaStream = await navigator.mediaDevices.getUserMedia({
             audio: {
                 mandatory: {
                     chromeMediaSource: 'tab',
@@ -85,27 +102,66 @@ async function setupAudioCapture(streamId, tabId) {
             }
         });
 
-        // Setup audio processing
-        audioContext = new AudioContext({ sampleRate: 16000 });
-        const source = audioContext.createMediaStreamSource(mediaStream);
+        tabAudioContext = new AudioContext({ sampleRate: 16000 });
+        const tabSource = tabAudioContext.createMediaStreamSource(tabMediaStream);
+        tabScriptProcessor = tabAudioContext.createScriptProcessor(4096, 1, 1);
 
-        // Use ScriptProcessorNode for audio processing
-        // Buffer size: 4096 samples
-        scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
-
-        scriptProcessor.onaudioprocess = (event) => {
+        tabScriptProcessor.onaudioprocess = (event) => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 const inputData = event.inputBuffer.getChannelData(0);
-                // Convert float32 to int16 PCM
                 const pcmData = float32ToInt16(inputData);
-                ws.send(pcmData.buffer);
+
+                if (isDualChannel) {
+                    const b64 = bufferToBase64(pcmData.buffer);
+                    ws.send(JSON.stringify({
+                        type: "audio",
+                        channel: "interviewer",
+                        data: b64
+                    }));
+                } else {
+                    ws.send(pcmData.buffer);
+                }
             }
         };
 
-        source.connect(scriptProcessor);
-        scriptProcessor.connect(audioContext.destination);
+        tabSource.connect(tabScriptProcessor);
+        tabScriptProcessor.connect(tabAudioContext.destination);
 
-        console.log('[Audio] Capture started');
+        // 2. 如果开启双通道，获取麦克风流 (候选人)
+        if (isDualChannel) {
+            micMediaStream = await navigator.mediaDevices.getUserMedia({
+                audio: true
+            });
+
+            micAudioContext = new AudioContext({ sampleRate: 16000 });
+            const micSource = micAudioContext.createMediaStreamSource(micMediaStream);
+            micScriptProcessor = micAudioContext.createScriptProcessor(4096, 1, 1);
+
+            micScriptProcessor.onaudioprocess = (event) => {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const inputData = event.inputBuffer.getChannelData(0);
+                    const pcmData = float32ToInt16(inputData);
+                    const b64 = bufferToBase64(pcmData.buffer);
+                    ws.send(JSON.stringify({
+                        type: "audio",
+                        channel: "candidate",
+                        data: b64
+                    }));
+                }
+            };
+
+            // 候选人麦克风流不需要连接 destination 以防在当前网页产生回音，但如果是 MV3 offscreen 可能也听不到。
+            // 为了安全起见，断开音频输出，只需要 capture。
+            micSource.connect(micScriptProcessor);
+            // micScriptProcessor doesn't strictly need connected to destination to process in some setups,
+            // but in Chrome it often needs a sink to fire `onaudioprocess`. We connect to destination but use gain=0 if needed.
+            const gainNode = micAudioContext.createGain();
+            gainNode.gain.value = 0;
+            micScriptProcessor.connect(gainNode);
+            gainNode.connect(micAudioContext.destination);
+        }
+
+        console.log('[Audio] Capture started. Dual Channel Enabled:', isDualChannel);
 
     } catch (error) {
         console.error('[Audio] Failed to get media stream:', error);
@@ -122,20 +178,43 @@ function float32ToInt16(float32Array) {
     return int16Array;
 }
 
+function bufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    // 使用大块拼接避免调用栈溢出
+    for (let i = 0; i < len; i += 32768) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 32768));
+    }
+    return btoa(binary);
+}
+
 function stopCapture() {
-    if (scriptProcessor) {
-        scriptProcessor.disconnect();
-        scriptProcessor = null;
+    if (tabScriptProcessor) {
+        tabScriptProcessor.disconnect();
+        tabScriptProcessor = null;
+    }
+    if (micScriptProcessor) {
+        micScriptProcessor.disconnect();
+        micScriptProcessor = null;
     }
 
-    if (audioContext) {
-        audioContext.close();
-        audioContext = null;
+    if (tabAudioContext) {
+        tabAudioContext.close();
+        tabAudioContext = null;
+    }
+    if (micAudioContext) {
+        micAudioContext.close();
+        micAudioContext = null;
     }
 
-    if (mediaStream) {
-        mediaStream.getTracks().forEach(track => track.stop());
-        mediaStream = null;
+    if (tabMediaStream) {
+        tabMediaStream.getTracks().forEach(track => track.stop());
+        tabMediaStream = null;
+    }
+    if (micMediaStream) {
+        micMediaStream.getTracks().forEach(track => track.stop());
+        micMediaStream = null;
     }
 
     if (ws) {

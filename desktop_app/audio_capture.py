@@ -15,6 +15,8 @@ import numpy as np
 CHUNK_16K = 3200  # 16kHz 每块帧数（≈200ms）
 RATE_MIC = 16000  # 麦克风目标采样率
 MAX_BUFFER_CHUNKS = 50  # 内存保护：每路最多保留约 10s 数据
+SOURCE_ACTIVE_RMS = 260
+SOURCE_DOMINANCE_RATIO = 1.25
 
 try:
     import pyaudio
@@ -88,11 +90,13 @@ def _find_devices(p):
 
 
 class AudioCapture:
-    def __init__(self, callback):
+    def __init__(self, callback, meta_callback=None, dual_stream_mode=False):
         if not PYAUDIO_OK:
             raise RuntimeError("PyAudio 未安装")
         self.p = pyaudio.PyAudio()
         self.callback = callback
+        self.meta_callback = meta_callback
+        self.dual_stream_mode = dual_stream_mode
         self.is_running = False
         self.mic_buffer = b""
         self.sys_buffer = b""
@@ -105,6 +109,37 @@ class AudioCapture:
         self.bh_chunk = max(CHUNK_16K, int(CHUNK_16K * self.bh_rate / RATE_MIC))
         self.mic_stream = None
         self.sys_stream = None
+
+    def _detect_source_activity(
+        self, mic_chunk: bytes | None, sys_chunk: bytes | None
+    ) -> tuple[str, int, int]:
+        mic_rms = audioop.rms(mic_chunk, 2) if mic_chunk else 0
+        sys_rms = audioop.rms(sys_chunk, 2) if sys_chunk else 0
+
+        if mic_rms < SOURCE_ACTIVE_RMS and sys_rms < SOURCE_ACTIVE_RMS:
+            return "none", mic_rms, sys_rms
+        if mic_rms >= SOURCE_ACTIVE_RMS and mic_rms >= sys_rms * SOURCE_DOMINANCE_RATIO:
+            return "mic", mic_rms, sys_rms
+        if sys_rms >= SOURCE_ACTIVE_RMS and sys_rms >= mic_rms * SOURCE_DOMINANCE_RATIO:
+            return "system", mic_rms, sys_rms
+        return "mixed", mic_rms, sys_rms
+
+    def _emit_source_meta(self, mic_chunk: bytes | None, sys_chunk: bytes | None):
+        if not self.meta_callback:
+            return
+        try:
+            dominant, mic_rms, sys_rms = self._detect_source_activity(
+                mic_chunk, sys_chunk
+            )
+            self.meta_callback(
+                {
+                    "dominant_source": dominant,
+                    "mic_rms": int(mic_rms),
+                    "system_rms": int(sys_rms),
+                }
+            )
+        except Exception:
+            return
 
     def start(self):
         self.is_running = True
@@ -171,24 +206,41 @@ class AudioCapture:
                 self.mic_buffer = self.mic_buffer[N:]
                 sys_chunk = self.sys_buffer[:N]
                 self.sys_buffer = self.sys_buffer[N:]
-                mic_np = np.frombuffer(mic_chunk, dtype=np.int16).astype(np.int32)
-                sys_np = np.frombuffer(sys_chunk, dtype=np.int16).astype(np.int32)
-                mixed = np.clip(mic_np + sys_np, -32768, 32767).astype(np.int16)
-                self.callback(mixed.tobytes())
+
+                if self.dual_stream_mode:
+                    # 分流模式，单独派发
+                    self.callback(sys_chunk, channel="system")
+                    self.callback(mic_chunk, channel="mic")
+                else:
+                    # 强混流模式
+                    mic_np = np.frombuffer(mic_chunk, dtype=np.int16).astype(np.int32)
+                    sys_np = np.frombuffer(sys_chunk, dtype=np.int16).astype(np.int32)
+                    mixed = np.clip(mic_np + sys_np, -32768, 32767).astype(np.int16)
+                    self.callback(mixed.tobytes())
+
+                self._emit_source_meta(mic_chunk, sys_chunk)
             return
 
         if has_mic:
             while len(self.mic_buffer) >= N:
                 chunk = self.mic_buffer[:N]
                 self.mic_buffer = self.mic_buffer[N:]
-                self.callback(chunk)
+                if self.dual_stream_mode:
+                    self.callback(chunk, channel="mic")
+                else:
+                    self.callback(chunk)
+                self._emit_source_meta(chunk, None)
             return
 
         if has_sys:
             while len(self.sys_buffer) >= N:
                 chunk = self.sys_buffer[:N]
                 self.sys_buffer = self.sys_buffer[N:]
-                self.callback(chunk)
+                if self.dual_stream_mode:
+                    self.callback(chunk, channel="system")
+                else:
+                    self.callback(chunk)
+                self._emit_source_meta(None, chunk)
 
     def _trim_buffers(self):
         max_bytes = CHUNK_16K * 2 * MAX_BUFFER_CHUNKS

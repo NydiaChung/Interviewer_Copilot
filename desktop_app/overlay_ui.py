@@ -1,7 +1,9 @@
 """
-OverlayUI — 面试助手悬浮窗
+OverlayUI — 面试助手悬浮窗（双栏布局版）
+左栏：实时字幕（微信式气泡分离说话人）
+右栏：AI 回答（一问一答卡片）
+
 置顶策略：纯 Qt 方案（WindowStaysOnTopHint + Tool + 500ms 定时 raise）
-完全移除 PyObjC / Cocoa 调用，避免 Segfault 崩溃
 """
 
 import os
@@ -16,22 +18,135 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QFileDialog,
     QScrollArea,
+    QSizePolicy,
+    QSplitter,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QFont, QShortcut, QKeySequence
+from PyQt6.QtGui import QFont, QShortcut, QKeySequence, QColor
+
+
+# ── 样式常量 ──
+CARD_BG = "rgba(18, 18, 18, 192)"
+INTERVIEWER_BUBBLE_BG = "rgba(59, 130, 246, 0.22)"  # 蓝色半透明
+CANDIDATE_BUBBLE_BG = "rgba(34, 197, 94, 0.18)"  # 绿色半透明
+HIGHLIGHT_BG = "rgba(250, 204, 21, 0.25)"  # 黄色高亮
+QA_CARD_BG = "rgba(255, 255, 255, 6)"
+FONT_FAMILY = "SF Pro Text"
+
+
+def _bubble_widget(role: str, text: str, highlighted: bool = False) -> QFrame:
+    """创建一个说话人气泡 Widget。"""
+    bubble = QFrame()
+    bubble.setObjectName("bubble")
+
+    is_interviewer = role == "interviewer"
+    prefix = "🔵 面试官" if is_interviewer else "🟢 我"
+    bg = INTERVIEWER_BUBBLE_BG if is_interviewer else CANDIDATE_BUBBLE_BG
+    align = "left" if is_interviewer else "right"
+    margin = "margin-right: 40px;" if is_interviewer else "margin-left: 40px;"
+
+    highlight_css = (
+        f"border-left: 3px solid rgba(250, 204, 21, 0.7); background: {HIGHLIGHT_BG};"
+        if highlighted
+        else ""
+    )
+
+    bubble.setStyleSheet(
+        f"""
+        QFrame#bubble {{
+            background: {bg};
+            border-radius: 10px;
+            padding: 8px 12px;
+            {margin}
+            {highlight_css}
+        }}
+    """
+    )
+
+    layout = QVBoxLayout(bubble)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(2)
+
+    # 说话人标签
+    role_label = QLabel(prefix)
+    role_label.setFont(QFont(FONT_FAMILY, 10, QFont.Weight.Bold))
+    role_label.setStyleSheet(
+        f"color: {'rgba(96, 165, 250, 0.9)' if is_interviewer else 'rgba(74, 222, 128, 0.9)'}; "
+        "background: transparent;"
+    )
+    layout.addWidget(role_label)
+
+    # 文本内容
+    text_label = QLabel(text)
+    text_label.setFont(QFont(FONT_FAMILY, 13))
+    text_label.setStyleSheet("color: rgba(255,255,255,200); background: transparent;")
+    text_label.setWordWrap(True)
+    text_label.setTextFormat(Qt.TextFormat.PlainText)
+    layout.addWidget(text_label)
+
+    bubble.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    return bubble
+
+
+def _qa_card_widget(question: str, answer: str, streaming: bool = False) -> QFrame:
+    """创建一个一问一答卡片。"""
+    card = QFrame()
+    card.setObjectName("qacard")
+    card.setStyleSheet(
+        f"""
+        QFrame#qacard {{
+            background: {QA_CARD_BG};
+            border: 1px solid rgba(255,255,255,8);
+            border-radius: 10px;
+            padding: 10px 12px;
+            margin-bottom: 6px;
+        }}
+    """
+    )
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(4)
+
+    q_label = QLabel(f"❓ {question}")
+    q_label.setFont(QFont(FONT_FAMILY, 11))
+    q_label.setStyleSheet("color: rgba(255,255,255,100); background: transparent;")
+    q_label.setWordWrap(True)
+    layout.addWidget(q_label)
+
+    status = "⏳" if streaming else "✅"
+    a_label = QLabel(f"{status} {answer}")
+    a_label.setObjectName("answer_text")
+    a_label.setFont(QFont(FONT_FAMILY, 13))
+    a_label.setStyleSheet("color: rgba(255,255,255,210); background: transparent;")
+    a_label.setWordWrap(True)
+    layout.addWidget(a_label)
+
+    card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    return card
 
 
 class OverlayUI(QWidget):
-    update_signal = pyqtSignal(str, str)
+    # 信号定义
+    update_signal = pyqtSignal(str, str)  # (msg_type, json_payload)
     end_session_signal = pyqtSignal()
     send_text_signal = pyqtSignal(str)
+    highlight_signal = pyqtSignal(int)  # question_id to highlight
 
     def __init__(self):
         super().__init__()
+        # 状态追踪
+        self._bubbles: list[dict] = (
+            []
+        )  # [{role, text, widget, question_id, highlighted}]
+        self._qa_cards: dict[int, QFrame] = {}  # question_id -> card widget
+        self._current_bubble_qid: int | None = (
+            None  # 当前正在更新的气泡对应的 question_id
+        )
+        self._current_bubble_role: str = "unknown"
         self.init_ui()
 
     def init_ui(self):
-        # ── 窗口标志：无边框、始终置顶、工具窗口 ──
+        # ── 窗口标志 ──
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -40,7 +155,7 @@ class OverlayUI(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        # ── 外层布局 ──
+        # ── 外层 ──
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -48,66 +163,120 @@ class OverlayUI(QWidget):
         self.card = QFrame()
         self.card.setObjectName("card")
         self.card.setStyleSheet(
-            """
-            #card {
-                background-color: rgba(18, 18, 18, 192);
+            f"""
+            #card {{
+                background-color: {CARD_BG};
                 border: 1px solid rgba(255, 255, 255, 20);
                 border-radius: 16px;
-            }
+            }}
         """
         )
         outer.addWidget(self.card)
 
-        layout = QVBoxLayout(self.card)
-        layout.setContentsMargins(18, 16, 18, 12)
-        layout.setSpacing(8)
+        card_layout = QVBoxLayout(self.card)
+        card_layout.setContentsMargins(14, 12, 14, 10)
+        card_layout.setSpacing(6)
 
-        # 1. 实时 ASR 文本（暗灰色）
-        self.asr_label = QLabel("🎤 正在倾听面试官...")
-        self.asr_label.setFont(QFont("SF Pro Text", 12))
-        self.asr_label.setStyleSheet(
-            "color: rgba(255,255,255,85); background: transparent;"
+        # ── 标题栏 ──
+        title_row = QHBoxLayout()
+        self.title_label = QLabel("🎙️ 面试助手")
+        self.title_label.setFont(QFont(FONT_FAMILY, 14, QFont.Weight.Bold))
+        self.title_label.setStyleSheet("color: #FFFFFF; background: transparent;")
+        title_row.addWidget(self.title_label)
+        title_row.addStretch()
+
+        self.status_label = QLabel("正在倾听...")
+        self.status_label.setFont(QFont(FONT_FAMILY, 11))
+        self.status_label.setStyleSheet(
+            "color: rgba(255,255,255,60); background: transparent;"
         )
-        self.asr_label.setWordWrap(True)
-        layout.addWidget(self.asr_label)
+        title_row.addWidget(self.status_label)
+        card_layout.addLayout(title_row)
 
-        # 2. 标题 / 状态
-        self.outline_label = QLabel("等待开启面试")
-        self.outline_label.setFont(QFont("SF Pro Text", 16, QFont.Weight.Bold))
-        self.outline_label.setStyleSheet("color: #FFFFFF; background: transparent;")
-        self.outline_label.setWordWrap(True)
-        layout.addWidget(self.outline_label)
-
-        # 3. 答案滚动区
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setMaximumHeight(200)
-        scroll.setStyleSheet("background: transparent; border: none;")
-        self.answer_label = QLabel("")
-        self.answer_label.setFont(QFont("SF Pro Text", 14))
-        self.answer_label.setStyleSheet(
-            "color: rgba(255,255,255,210); background: transparent; padding: 2px 0;"
-        )
-        self.answer_label.setWordWrap(True)
-        self.answer_label.setAlignment(Qt.AlignmentFlag.AlignTop)
-        scroll.setWidget(self.answer_label)
-        layout.addWidget(scroll)
-
-        # ── 分隔线 ──
+        # ── 分割线 ──
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(
-            "background: rgba(255,255,255,15); border: none; max-height: 1px;"
+            "background: rgba(255,255,255,12); border: none; max-height: 1px;"
         )
-        layout.addWidget(sep)
+        card_layout.addWidget(sep)
 
-        # 4. 输入行
+        # ── 双栏主体 ──
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setStyleSheet(
+            "QSplitter::handle { background: rgba(255,255,255,8); width: 2px; }"
+        )
+
+        # 左栏：字幕
+        left_frame = QFrame()
+        left_layout = QVBoxLayout(left_frame)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+
+        left_title = QLabel("💬 实时字幕")
+        left_title.setFont(QFont(FONT_FAMILY, 11, QFont.Weight.Bold))
+        left_title.setStyleSheet(
+            "color: rgba(255,255,255,60); background: transparent; padding: 4px 0;"
+        )
+        left_layout.addWidget(left_title)
+
+        self.subtitle_scroll = QScrollArea()
+        self.subtitle_scroll.setWidgetResizable(True)
+        self.subtitle_scroll.setMinimumHeight(260)
+        self.subtitle_scroll.setStyleSheet("background: transparent; border: none;")
+        self.subtitle_container = QWidget()
+        self.subtitle_layout = QVBoxLayout(self.subtitle_container)
+        self.subtitle_layout.setContentsMargins(4, 4, 4, 4)
+        self.subtitle_layout.setSpacing(6)
+        self.subtitle_layout.addStretch()  # 气泡从底部向上堆叠
+        self.subtitle_scroll.setWidget(self.subtitle_container)
+        left_layout.addWidget(self.subtitle_scroll)
+
+        # 右栏：回答
+        right_frame = QFrame()
+        right_layout = QVBoxLayout(right_frame)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
+        right_title = QLabel("🤖 AI 回答")
+        right_title.setFont(QFont(FONT_FAMILY, 11, QFont.Weight.Bold))
+        right_title.setStyleSheet(
+            "color: rgba(255,255,255,60); background: transparent; padding: 4px 0;"
+        )
+        right_layout.addWidget(right_title)
+
+        self.answer_scroll = QScrollArea()
+        self.answer_scroll.setWidgetResizable(True)
+        self.answer_scroll.setMinimumHeight(260)
+        self.answer_scroll.setStyleSheet("background: transparent; border: none;")
+        self.answer_container = QWidget()
+        self.answer_layout = QVBoxLayout(self.answer_container)
+        self.answer_layout.setContentsMargins(4, 4, 4, 4)
+        self.answer_layout.setSpacing(6)
+        self.answer_layout.addStretch()
+        self.answer_scroll.setWidget(self.answer_container)
+        right_layout.addWidget(self.answer_scroll)
+
+        splitter.addWidget(left_frame)
+        splitter.addWidget(right_frame)
+        splitter.setSizes([540, 360])
+        card_layout.addWidget(splitter)
+
+        # ── 分隔线 ──
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet(
+            "background: rgba(255,255,255,12); border: none; max-height: 1px;"
+        )
+        card_layout.addWidget(sep2)
+
+        # ── 输入行 ──
         row = QHBoxLayout()
         row.setSpacing(8)
 
         self.text_input = QTextEdit()
         self.text_input.setPlaceholderText("手动输入提问，Ctrl+Enter 发送...")
-        self.text_input.setMaximumHeight(70)
+        self.text_input.setMaximumHeight(60)
         self.text_input.setStyleSheet(
             """
             QTextEdit {
@@ -134,25 +303,27 @@ class OverlayUI(QWidget):
 
         self.btn_send = QPushButton("↑")
         self.btn_send.setFixedSize(34, 34)
-        self.btn_send.setFont(QFont("SF Pro Text", 16, QFont.Weight.Bold))
+        self.btn_send.setFont(QFont(FONT_FAMILY, 16, QFont.Weight.Bold))
         self.btn_send.setStyleSheet(self._btn_css(primary=True))
         self.btn_send.clicked.connect(self.send_text)
         col.addWidget(self.btn_send)
 
         row.addLayout(col)
-        layout.addLayout(row)
+        card_layout.addLayout(row)
 
-        # 5. 底部提示
+        # ── 底部提示 ──
         hint = QLabel("Option+E 结束并复盘")
         hint.setStyleSheet(
             "color: rgba(255,255,255,38); font-size: 11px; background: transparent;"
         )
         hint.setAlignment(Qt.AlignmentFlag.AlignRight)
-        layout.addWidget(hint)
+        card_layout.addWidget(hint)
 
-        self.setFixedWidth(520)
+        # ── 窗口尺寸 ──
+        self.setFixedWidth(920)
+        self.setMinimumHeight(420)
         self.adjustSize()
-        self.move(80, 80)
+        self.move(40, 60)
 
         # ── 快捷键 ──
         QShortcut(QKeySequence("Alt+E"), self).activated.connect(
@@ -163,40 +334,214 @@ class OverlayUI(QWidget):
         )
         QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self.send_text)
 
-        self.update_signal.connect(self.update_text)
+        # ── 信号连接 ──
+        self.update_signal.connect(self._on_update)
+        self.highlight_signal.connect(self._highlight_question)
 
-    def _qt_raise(self):
-        """纯 Qt 置顶：raise_() 将窗口提到所有同级窗口的最前面"""
-        self.raise_()
+    # ════════════════════════════════════════════════════
+    # 核心更新逻辑
+    # ════════════════════════════════════════════════════
 
-    # ── 内容更新 ──
-    def update_text(self, msg_type: str, text: str):
+    def _on_update(self, msg_type: str, payload: str):
+        """统一处理后端推送消息。payload 为 JSON 字符串。"""
+        import json
+
+        try:
+            data = (
+                json.loads(payload)
+                if payload.startswith("{")
+                else {"text": payload, "answer": payload}
+            )
+        except Exception:
+            data = {"text": payload, "answer": payload}
+
         if msg_type == "incremental":
-            self.asr_label.setText(f"🎤 {text}")
+            self._handle_incremental(data)
         elif msg_type == "outline":
-            self.outline_label.setText("⚡ 要点草稿（可先回答）")
-            self.answer_label.setText(text)
+            self._handle_outline(data)
         elif msg_type == "answer":
-            self.asr_label.setText("🎤 正在倾听...")
-            self.outline_label.setText("✅ 完整回答（定稿）")
-            self.answer_label.setText(text)
+            self._handle_answer(data)
         elif msg_type == "analysis":
-            self.asr_label.hide()
-            self.outline_label.setText("📊 面试复盘报告")
-            self.answer_label.setText(text)
-            self.setFixedWidth(680)
-            self.adjustSize()
+            self._handle_analysis(data)
 
-    # ── 文本发送 ──
+    def _handle_incremental(self, data: dict):
+        """处理实时字幕增量更新。"""
+        text = data.get("text", "")
+        question_id = data.get("question_id")
+        role = data.get("speaker_role", "unknown")
+        # 归一化角色
+        if role == "interviewer":
+            display_role = "interviewer"
+        elif role == "candidate":
+            display_role = "candidate"
+        else:
+            display_role = "interviewer"  # 默认视为面试官
+
+        self.status_label.setText("正在倾听...")
+
+        # 同一 question_id + 同一角色：更新最后一个气泡
+        if (
+            question_id is not None
+            and question_id == self._current_bubble_qid
+            and display_role == self._current_bubble_role
+            and self._bubbles
+        ):
+            last = self._bubbles[-1]
+            # 更新文本
+            text_label = last["widget"].findChildren(QLabel)[
+                -1
+            ]  # 最后一个 QLabel 是文本
+            text_label.setText(text)
+            last["text"] = text
+        else:
+            # 新建气泡
+            bubble = _bubble_widget(display_role, text)
+            self._bubbles.append(
+                {
+                    "role": display_role,
+                    "text": text,
+                    "widget": bubble,
+                    "question_id": question_id,
+                    "highlighted": False,
+                }
+            )
+            # 插入到 stretch 之前
+            idx = self.subtitle_layout.count() - 1
+            self.subtitle_layout.insertWidget(idx, bubble)
+            self._current_bubble_qid = question_id
+            self._current_bubble_role = display_role
+
+        # 自动滚动到底部
+        QTimer.singleShot(
+            50,
+            lambda: self.subtitle_scroll.verticalScrollBar().setValue(
+                self.subtitle_scroll.verticalScrollBar().maximum()
+            ),
+        )
+
+    def _handle_outline(self, data: dict):
+        """处理要点草稿。"""
+        answer = data.get("answer", data.get("text", ""))
+        question_id = data.get("question_id")
+        self.status_label.setText("⚡ 草稿生成中...")
+        self._upsert_qa_card(question_id, "（识别中…）", answer, streaming=True)
+
+    def _handle_answer(self, data: dict):
+        """处理正式回答。"""
+        answer = data.get("answer", "")
+        question = data.get("question", "")
+        question_id = data.get("question_id")
+        streaming = data.get("streaming", False)
+
+        self.status_label.setText(
+            "正在倾听..." if not streaming else "⏳ 回答生成中..."
+        )
+        self._upsert_qa_card(question_id, question, answer, streaming=streaming)
+
+        # 高亮对应的字幕气泡
+        if question_id is not None and not streaming:
+            self._highlight_question(question_id)
+
+    def _handle_analysis(self, data: dict):
+        """处理复盘报告——特殊全屏展示。"""
+        answer = data.get("answer", data.get("text", ""))
+        self.status_label.setText("📊 复盘已完成")
+        # 清空右栏，放复盘内容
+        self._clear_layout(self.answer_layout)
+        self.answer_layout.addStretch()
+        report = QLabel(answer)
+        report.setFont(QFont(FONT_FAMILY, 13))
+        report.setStyleSheet("color: rgba(255,255,255,210); background: transparent;")
+        report.setWordWrap(True)
+        report.setTextFormat(Qt.TextFormat.MarkdownText)
+        idx = self.answer_layout.count() - 1
+        self.answer_layout.insertWidget(idx, report)
+        self.setFixedWidth(960)
+        self.adjustSize()
+
+    # ════════════════════════════════════════════════════
+    # 辅助方法
+    # ════════════════════════════════════════════════════
+
+    def _upsert_qa_card(
+        self, question_id, question: str, answer: str, streaming: bool = False
+    ):
+        """创建或更新一问一答卡片。"""
+        if question_id is not None and question_id in self._qa_cards:
+            card = self._qa_cards[question_id]
+            # 更新答案文本
+            a_label = card.findChild(QLabel, "answer_text")
+            if a_label:
+                status = "⏳" if streaming else "✅"
+                a_label.setText(f"{status} {answer}")
+        else:
+            card = _qa_card_widget(question, answer, streaming)
+            if question_id is not None:
+                self._qa_cards[question_id] = card
+            idx = self.answer_layout.count() - 1
+            self.answer_layout.insertWidget(idx, card)
+
+        # 自动滚动
+        QTimer.singleShot(
+            50,
+            lambda: self.answer_scroll.verticalScrollBar().setValue(
+                self.answer_scroll.verticalScrollBar().maximum()
+            ),
+        )
+
+    def _highlight_question(self, question_id: int):
+        """高亮指定 question_id 对应的字幕气泡。"""
+        for entry in self._bubbles:
+            if entry.get("question_id") == question_id and not entry.get("highlighted"):
+                entry["highlighted"] = True
+                role = entry["role"]
+                bg = (
+                    INTERVIEWER_BUBBLE_BG
+                    if role == "interviewer"
+                    else CANDIDATE_BUBBLE_BG
+                )
+                margin = (
+                    "margin-right: 40px;"
+                    if role == "interviewer"
+                    else "margin-left: 40px;"
+                )
+                entry["widget"].setStyleSheet(
+                    f"""
+                    QFrame#bubble {{
+                        background: {bg};
+                        border-radius: 10px;
+                        padding: 8px 12px;
+                        {margin}
+                        border-left: 3px solid rgba(250, 204, 21, 0.7);
+                        background: {HIGHLIGHT_BG};
+                    }}
+                """
+                )
+
+    def _clear_layout(self, layout):
+        """递归清空布局中的所有 Widget。"""
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+            elif item.layout():
+                self._clear_layout(item.layout())
+
+    # ════════════════════════════════════════════════════
+    # 输入与交互
+    # ════════════════════════════════════════════════════
+
     def send_text(self):
         text = self.text_input.toPlainText().strip()
         if text:
             self.send_text_signal.emit(text)
             self.text_input.clear()
-            self.outline_label.setText(f"📨 {text[:60]}")
-            self.answer_label.setText("正在生成回答...")
+            # 在字幕区添加候选人气泡
+            bubble = _bubble_widget("candidate", f"📨 {text}")
+            idx = self.subtitle_layout.count() - 1
+            self.subtitle_layout.insertWidget(idx, bubble)
 
-    # ── 图片发送 ──
     def send_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择图片", "", "Images (*.png *.jpg *.jpeg *.webp)"
@@ -212,9 +557,8 @@ class OverlayUI(QWidget):
             if resp.status_code == 200:
                 extracted = resp.json().get("text", "[图片内容]")
                 self.send_text_signal.emit(f"[图片] {extracted}")
-                self.answer_label.setText("图片已发送，正在分析...")
         except Exception as e:
-            self.answer_label.setText(f"图片上传失败: {e}")
+            self.status_label.setText(f"图片上传失败: {e}")
 
     # ── 拖动 ──
     def mousePressEvent(self, event):

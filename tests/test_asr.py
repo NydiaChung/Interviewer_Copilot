@@ -50,9 +50,13 @@ async def test_doubao_receiver_buffer_recomposition():
     if not hasattr(provider, "_recv_buffer"):
         provider._recv_buffer = bytearray()
 
-    # 模拟一个完整的回包: [4B头] + [4B序列号] + [4B长度] + [JSON]
-    # 豆包 V3 服务端回包是 12 字节头
-    message = {"result": {"text": "你好", "is_final": True}}
+    # Fix 1: 豆包 V3 句末标志在 utterances[].definite，而非顶层 is_final
+    message = {
+        "result": {
+            "text": "你好",
+            "utterances": [{"text": "你好", "definite": True}],
+        }
+    }
     payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
 
     # 构造包：4B协议头 + 4B序列号(0) + 4B长度 + Payload
@@ -63,7 +67,7 @@ async def test_doubao_receiver_buffer_recomposition():
         + payload
     )
 
-    # 故意将包拆分为极细碎的帧
+    # 故意将包拆分为极细码的帧
     chunks = [full_packet[i : i + 1] for i in range(len(full_packet))]
 
     processed_results = []
@@ -84,12 +88,48 @@ async def test_doubao_receiver_buffer_recomposition():
     # 给异步任务一点时间运行
     await asyncio.sleep(0.1)
 
-    # 验证结果
+    # 验证结果: text 正确， is_sentence_end=True
     assert len(processed_results) == 1
     assert processed_results[0][0] == "你好"
-    assert processed_results[0][1] is True
+    assert (
+        processed_results[0][1] is True
+    )  # Fix 1: utterances[].definite=True 应被正确解析
     # 验证缓冲区已清空
     assert len(provider._recv_buffer) == 0
+
+
+@pytest.mark.asyncio
+async def test_doubao_receiver_no_utterances_defaults_to_false():
+    """Fix 1: 当 utterances 为空时， is_sentence_end 应为 False。"""
+    provider = DoubaoProvider()
+    if not hasattr(provider, "_recv_buffer"):
+        provider._recv_buffer = bytearray()
+
+    # 不含 utterances，也不含 is_final
+    message = {"result": {"text": "测试"}}
+    payload = json.dumps(message, ensure_ascii=False).encode("utf-8")
+    full_packet = (
+        b"\x11\x10\x11\x00"
+        + b"\x00\x00\x00\x00"
+        + struct.pack(">I", len(payload))
+        + payload
+    )
+
+    processed_results = []
+
+    async def mock_callback(text, end):
+        processed_results.append((text, end))
+
+    provider.on_text_update = mock_callback
+    provider.loop = asyncio.get_running_loop()
+    mock_ws = MagicMock()
+    mock_ws.__aiter__.side_effect = lambda: async_iter([full_packet])
+    await provider._receiver(mock_ws)
+    await asyncio.sleep(0.1)
+
+    assert len(processed_results) == 1
+    assert processed_results[0][0] == "测试"
+    assert processed_results[0][1] is False  # 没有 definite=True，应为 False
 
 
 @pytest.mark.asyncio

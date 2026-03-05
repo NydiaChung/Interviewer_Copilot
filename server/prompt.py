@@ -1,4 +1,6 @@
-"""Prompt template for interview answer generation."""
+"""Prompt template for interview answer generation.
+修改说明请参阅项目根目录的 PROMPT_GUIDE.md。
+"""
 
 INTERVIEW_PROMPT = """你是求职者的面试辅助AI。
 

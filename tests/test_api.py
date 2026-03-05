@@ -140,6 +140,10 @@ def test_manual_question_does_not_trigger_analysis():
     ):
         with client.websocket_connect("/ws/audio") as ws:
             ws.send_text(json.dumps({"command": "manual_question", "text": "你好"}))
+            # 内部新增了一条回显的 incremental 消息
+            incremental = ws.receive_json()
+            assert incremental["type"] == "incremental"
+            # 验证真正的回答
             response = ws.receive_json()
             assert response["type"] == "answer"
             assert response["answer"] == "answer:你好"
@@ -196,6 +200,10 @@ def test_manual_question_returns_fallback_when_llm_fails():
     ):
         with client.websocket_connect("/ws/audio") as ws:
             ws.send_text(json.dumps({"command": "manual_question", "text": "你好"}))
+            # 内部新增了一条回显的 incremental 消息
+            incremental = ws.receive_json()
+            assert incremental["type"] == "incremental"
+            # 验证真正的回答
             response = ws.receive_json()
             assert response["type"] == "answer"
             assert "抱歉，我刚才没来得及生成完整回答" in response["answer"]

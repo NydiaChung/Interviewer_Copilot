@@ -1,4 +1,9 @@
-"""Heuristic intent readiness detector for early outline generation."""
+"""统一意图检测模块 — 问题识别 + 草稿生成时机判断。
+
+暴露的公共接口：
+  - is_question_like(text)          判断文本是否类似问题（供 main.py 关闭决策使用）
+  - IntentReadinessDetector         判断 ASR 中间结果何时足够成熟可生成草稿 outline
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,8 @@ import time
 from difflib import SequenceMatcher
 
 
+# ── 问题信号词汇 ─────────────────────────────────────────────────────────────
+# 疑问句：以疑问词或句末助词结尾的句子
 QUESTION_HINTS = (
     "?",
     "？",
@@ -19,9 +26,12 @@ QUESTION_HINTS = (
     "which",
     "when",
     "where",
+    # 疑问副词
     "介绍",
     "说说",
     "讲讲",
+    "谈谈",
+    "聊聊",
     "解释",
     "原因",
     "怎么",
@@ -31,6 +41,18 @@ QUESTION_HINTS = (
     "能不能",
     "可不可以",
     "请你",
+    # 陈述式问题（Fix 5 新增）
+    "什么",
+    "哪些",
+    "哪种",
+    "具体",
+    "经验",
+    "背景",
+    "过程",
+    "遇到",
+    "说明",
+    "描述",
+    "是否",
 )
 
 INTENT_KEYWORDS = (
@@ -67,8 +89,19 @@ def _similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
+def is_question_like(text: str) -> bool:
+    """判断文本是否含问题信号词。
+
+    供 main.py 的问题关闭决策调用，替代原有的 _is_question_like() 局部函数。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    return any(h in t for h in QUESTION_HINTS)
+
+
 class IntentReadinessDetector:
-    """Decide when partial ASR text is stable/clear enough for draft outline."""
+    """决策何时 ASR 中间文本已足够稳定/清晰，可以预生成 outline 草稿。"""
 
     def __init__(
         self,

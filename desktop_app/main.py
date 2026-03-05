@@ -1,8 +1,11 @@
+import os
 import sys
 import asyncio
 import threading
 import websockets
 import json
+import time
+import base64
 from PyQt6.QtWidgets import QApplication
 from overlay_ui import OverlayUI
 from control_panel import ControlPanelUI
@@ -17,7 +20,8 @@ except Exception as e:
     AudioCapture = None
 
 # Use the local backend url
-WS_URL = "ws://localhost:8000/ws/audio"
+WS_URL = os.getenv("WS_URL", "ws://localhost:8000/ws/audio")
+DUAL_STREAM_MODE = os.getenv("DUAL_STREAM_MODE", "true").lower()
 
 
 class DesktopApp:
@@ -33,6 +37,8 @@ class DesktopApp:
         self.audio_queue = None
         self.latest_answer_seq = 0
         self.latest_outline_seq = 0
+        self._last_source_meta_ts = 0.0
+        self._last_source_dominant = ""
 
         # 2. Start Control Panel
         self.control_panel = ControlPanelUI()
@@ -46,19 +52,25 @@ class DesktopApp:
             return
         self.latest_answer_seq = 0
         self.latest_outline_seq = 0
+        self._last_source_meta_ts = 0.0
+        self._last_source_dominant = ""
 
-        # 1. Show the overlay
+        # 3. Show the overlay
         self.overlay = OverlayUI()
         self.overlay.show()
 
-        # 2. Setup signals from overlay
+        # 4. Setup signals from overlay
         self.overlay.end_session_signal.connect(self.trigger_end_session)
         self.overlay.send_text_signal.connect(self.on_manual_text)
 
-        # 3. Setup Audio capture (graceful if PyAudio not installed)
+        # 5. Setup Audio capture (graceful if PyAudio not installed)
         if AUDIO_AVAILABLE:
             try:
-                self.audio = AudioCapture(self.on_audio_data)
+                self.audio = AudioCapture(
+                    self.on_audio_data,
+                    self.on_audio_meta,
+                    dual_stream_mode=DUAL_STREAM_MODE,
+                )
             except Exception as e:
                 print(f"[Audio] Failed to init AudioCapture: {e}")
                 self.audio = None
@@ -73,7 +85,7 @@ class DesktopApp:
                 "⚠️ PyAudio 未安装，语音采集关闭。可用下方输入框手动提问。",
             )
 
-        # 4. Setup Asyncio loop for WebSockets
+        # 6. Setup Asyncio loop for WebSockets
         self.loop = asyncio.new_event_loop()
         self.ws_thread = threading.Thread(target=self.start_async_loop, daemon=True)
         self.ws_thread.start()
@@ -97,9 +109,44 @@ class DesktopApp:
         payload = json.dumps({"command": "manual_question", "text": text})
         self._enqueue_ws_payload(payload)  # str, NOT encoded bytes
 
-    def on_audio_data(self, audio_bytes):
+    def on_audio_data(self, audio_bytes, channel: str = None):
         """Called directly by PyAudio in its C-thread. Thread-safe push to asyncio queue."""
-        self._enqueue_ws_payload(audio_bytes)
+        if channel:
+            # 双向/双流模式：将音频转换成 base64 存入字典再转回 str 以 JSON 给队列处理
+            payload = json.dumps(
+                {
+                    "type": "audio",
+                    "channel": channel,
+                    "data": base64.b64encode(audio_bytes).decode("ascii"),
+                }
+            )
+            self._enqueue_ws_payload(payload)
+        else:
+            self._enqueue_ws_payload(audio_bytes)
+
+    def on_audio_meta(self, meta: dict):
+        """Called by AudioCapture with source activity metadata."""
+        if not isinstance(meta, dict):
+            return
+        now = time.monotonic()
+        dominant = str(meta.get("dominant_source", "unknown"))
+        # 降低控制帧频率：源发生变化时立即上报，否则 250ms 采样上报。
+        if (
+            dominant == self._last_source_dominant
+            and (now - self._last_source_meta_ts) < 0.25
+        ):
+            return
+        self._last_source_meta_ts = now
+        self._last_source_dominant = dominant
+        payload = json.dumps(
+            {
+                "command": "source_activity",
+                "dominant_source": dominant,
+                "mic_rms": int(meta.get("mic_rms", 0)),
+                "system_rms": int(meta.get("system_rms", 0)),
+            }
+        )
+        self._enqueue_ws_payload(payload)
 
     def _enqueue_ws_payload(self, payload):
         if not self.loop or not self.audio_queue:
@@ -128,8 +175,6 @@ class DesktopApp:
                             message = await websocket.recv()
                             data = json.loads(message)
                             msg_type = data.get("type", "answer")
-                            answer = data.get("answer", "")
-                            text = data.get("text", "")
                             raw_seq = data.get("seq", 0)
                             try:
                                 seq = int(raw_seq or 0)
@@ -150,16 +195,14 @@ class DesktopApp:
                                 if seq:
                                     self.latest_answer_seq = seq
 
-                            # Safely update PyQt UI from the asyncio thread using Qt Signals
+                            # 将完整 JSON 数据序列化后传给 overlay，使其能解析
+                            # speaker_role、question_id、question 等字段
                             if self.overlay:
-                                if msg_type == "incremental":
-                                    self.overlay.update_signal.emit(msg_type, text)
-                                else:
-                                    self.overlay.update_signal.emit(msg_type, answer)
+                                payload_str = json.dumps(data, ensure_ascii=False)
+                                self.overlay.update_signal.emit(msg_type, payload_str)
 
                             # If it's the final analysis, tell the control panel to refresh
                             if msg_type == "analysis":
-                                # Cross-thread UI updates must go through Qt signals.
                                 self.control_panel.interview_ended_signal.emit()
 
                     except websockets.exceptions.ConnectionClosed:
@@ -180,7 +223,8 @@ class DesktopApp:
                             self.audio.stop()
                     elif isinstance(chunk, str):
                         # 文本命令（manual_question 等）
-                        print(f"[Desktop] Sending text command: {chunk[:80]}")
+                        if not chunk.startswith('{"command": "source_activity"'):
+                            print(f"[Desktop] Sending text command: {chunk[:80]}")
                         await websocket.send(chunk)
                     else:
                         # 音频二进制帧
