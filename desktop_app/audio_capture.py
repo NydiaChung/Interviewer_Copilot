@@ -28,25 +28,47 @@ except Exception as e:
     PYAUDIO_OK = False
 
 
+"""
+设备索引列表
+0 “🌙’s iPhone17 pro”的麦克风 in: 1 out: 0 
+1 BlackHole 16ch in: 16 out: 16 
+2 BlackHole 2ch in: 2 out: 2 
+3 MacBook Pro麦克风 in: 1 out: 0 
+4 MacBook Pro扬声器 in: 0 out: 2 
+5 Libratone UP in: 1 out: 0 
+6 Libratone UP in: 0 out: 2 
+7 多输出设备 in: 0 out: 2
+"""
+
+
 def _find_devices(p):
-    """遍历 PyAudio 设备列表，返回 (mic_index, system_index, bh_channels, bh_rate)"""
-    mic_index = None
-    system_index = None
-    bh_channels = 2
-    bh_rate = 48000
+    """
+    遍历 PyAudio 设备列表，返回 (mic_index, system_index, bh_channels, bh_rate)
+    mic_index：麦克风设备的索引；
+    system_index：BlackHole 设备的索引（用于采集系统声音）；
+    bh_channels：BlackHole 设备的输入通道数；
+    bh_rate：BlackHole 设备的默认采样率。
+    """
+    mic_index = None  # 麦克风设备索引（初始为空）
+    system_index = None  # BlackHole 设备索引（初始为空）
+    bh_channels = 2  # BlackHole 默认通道数（2ch）
+    bh_rate = 48000  # BlackHole 默认采样率（48000Hz）
 
     # 遍历：优先选 BlackHole 2ch，次选 BlackHole 16ch
-    bh2_idx = None
-    bh16_idx = None
+    bh2_idx = None  # BlackHole 2ch 设备索引（临时变量）
+    bh16_idx = None  # BlackHole 16ch 设备索引（临时变量）
 
+    # 获取第i个设备的详细信息
     for i in range(p.get_device_count()):
         dev = p.get_device_info_by_index(i)
         name = dev.get("name", "").lower()
-        ch = dev.get("maxInputChannels", 0)
-        rate = int(dev.get("defaultSampleRate", 48000))
+        ch = dev.get(
+            "maxInputChannels", 0
+        )  # 最大输入通道数，0 表示该设备只有输出，没有输入，比如音箱
+        rate = int(dev.get("defaultSampleRate", 48000))  # 默认采样率
+
         if ch <= 0:
             continue
-
         if "blackhole 2ch" in name:
             bh2_idx = i
         elif "blackhole 16ch" in name:
@@ -76,7 +98,7 @@ def _find_devices(p):
             f"[Audio] 系统声音 → #{system_index}: {dev['name']}  ch={bh_channels}  rate={bh_rate}"
         )
 
-    # 麦克风回退：第一个非 BlackHole 输入设备
+    # 麦克风回退：第一个有输入通道 + 不是 BlackHole 的设备
     if mic_index is None:
         for i in range(p.get_device_count()):
             dev = p.get_device_info_by_index(i)
@@ -110,6 +132,13 @@ class AudioCapture:
         self.mic_stream = None
         self.sys_stream = None
 
+    """
+    音频源活动状态检测:
+    1. 计算麦克风（mic）和系统音频（sys）的音量值（RMS）；
+    2. 根据音量阈值和占比规则，判断当前 “谁在发声”（麦克风 / 系统 / 都没声 / 混合发声）；
+    3. 返回检测结果（主导音频源、麦克风音量、系统音量），为后续元数据上报提供核心依据。
+    """
+
     def _detect_source_activity(
         self, mic_chunk: bytes | None, sys_chunk: bytes | None
     ) -> tuple[str, int, int]:
@@ -123,6 +152,10 @@ class AudioCapture:
         if sys_rms >= SOURCE_ACTIVE_RMS and sys_rms >= mic_rms * SOURCE_DOMINANCE_RATIO:
             return "system", mic_rms, sys_rms
         return "mixed", mic_rms, sys_rms
+
+    """
+    发送音频源活动状态元数据：检测+触发上报
+    """
 
     def _emit_source_meta(self, mic_chunk: bytes | None, sys_chunk: bytes | None):
         if not self.meta_callback:
@@ -138,7 +171,8 @@ class AudioCapture:
                     "system_rms": int(sys_rms),
                 }
             )
-        except Exception:
+        except Exception as e:
+            print(f"[Audio] _emit_source_meta(发送音频源活动状态元数据) error: {e}")
             return
 
     def start(self):
@@ -153,8 +187,8 @@ class AudioCapture:
                     rate=RATE_MIC,
                     input=True,
                     input_device_index=self.mic_index,
-                    frames_per_buffer=CHUNK_16K,
-                    stream_callback=self._mic_callback,
+                    frames_per_buffer=CHUNK_16K,  # 每次回调的音频块大小：控制单次采集的数据量
+                    stream_callback=self._mic_callback,  # 回调函数：每次采集到数据时触发
                 )
                 self.mic_stream.start_stream()
                 print("[Audio] 麦克风流已开启（16kHz）")
@@ -176,15 +210,15 @@ class AudioCapture:
                 )
                 self.sys_stream.start_stream()
                 print(
-                    f"[Audio] BlackHole 流已开启  ch={self.bh_channels}  "
+                    f"[Audio] BlackHole 流已开启， system_index={self.system_index}，  ch={self.bh_channels}  "
                     f"{self.bh_rate}Hz→{RATE_MIC}Hz  (audioop.ratecv)"
                 )
             except Exception as e:
                 print(f"[Audio] BlackHole 流失败: {e}")
                 self.sys_stream = None
 
+    # 系统音频格式标准化处理：多声道 + 任意采样率 → 16kHz 单声道（精确重采样）
     def _sys_to_16k_mono(self, raw: bytes) -> bytes:
-        """多声道 + 任意采样率 → 16kHz 单声道（精确重采样）"""
         ch = self.bh_channels
         # 1. 多声道 → 单声道（各声道平均）
         data = np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
