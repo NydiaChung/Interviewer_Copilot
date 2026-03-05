@@ -21,7 +21,7 @@ SOURCE_DOMINANCE_RATIO = 1.25
 try:
     import pyaudio
 
-    FORMAT = pyaudio.paInt16
+    FORMAT = pyaudio.paFloat32
     PYAUDIO_OK = True
 except Exception as e:
     print(f"[Audio] PyAudio 不可用: {e}")
@@ -187,8 +187,8 @@ class AudioCapture:
         """多声道 + 任意采样率 → 16kHz 单声道（精确重采样）"""
         ch = self.bh_channels
         # 1. 多声道 → 单声道（各声道平均）
-        data = np.frombuffer(raw, dtype=np.int16).reshape(-1, ch)
-        mono = data.mean(axis=1).astype(np.int16).tobytes()
+        data = np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
+        mono = data.mean(axis=1).astype(np.float32).tobytes()
         # 2. 任意采样率 → 16kHz（audioop.ratecv 保持连续状态，不引入断续噪声）
         mono_16k, self._ratecv_state = audioop.ratecv(
             mono, 2, 1, self.bh_rate, RATE_MIC, self._ratecv_state
@@ -196,7 +196,7 @@ class AudioCapture:
         return mono_16k
 
     def _mix_and_send(self):
-        N = CHUNK_16K * 2  # 字节数（int16 = 2 bytes/sample）
+        N = CHUNK_16K * 2  # 字节数（float32 = 2 bytes/sample）
         has_mic = self.mic_stream is not None
         has_sys = self.sys_stream is not None
 
@@ -213,9 +213,9 @@ class AudioCapture:
                     self.callback(mic_chunk, channel="mic")
                 else:
                     # 强混流模式
-                    mic_np = np.frombuffer(mic_chunk, dtype=np.int16).astype(np.int32)
-                    sys_np = np.frombuffer(sys_chunk, dtype=np.int16).astype(np.int32)
-                    mixed = np.clip(mic_np + sys_np, -32768, 32767).astype(np.int16)
+                    mic_np = np.frombuffer(mic_chunk, dtype=np.float32).astype(np.int32)
+                    sys_np = np.frombuffer(sys_chunk, dtype=np.float32).astype(np.int32)
+                    mixed = np.clip(mic_np + sys_np, -32768, 32767).astype(np.float32)
                     self.callback(mixed.tobytes())
 
                 self._emit_source_meta(mic_chunk, sys_chunk)

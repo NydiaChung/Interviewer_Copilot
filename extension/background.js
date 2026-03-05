@@ -1,4 +1,4 @@
-// Background service worker for Interview Copilot
+// Chrome 浏览器扩展的后台服务工作线程
 
 const WS_URL = 'ws://localhost:8000/ws/audio';
 
