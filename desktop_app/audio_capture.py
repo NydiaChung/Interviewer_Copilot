@@ -229,10 +229,30 @@ class AudioCapture:
         )
         return mono_16k
 
-    def _mix_and_send(self):
+    def _send_audio(self):
         N = CHUNK_16K * 2  # 字节数（float32 = 2 bytes/sample）
         has_mic = self.mic_stream is not None
         has_sys = self.sys_stream is not None
+
+        # # 先处理所有麦克风数据，缓存最后一个块用于元数据上报
+        # last_mic_chunk = None
+        # if has_mic:
+        #     while len(self.mic_buffer) >= N:
+        #         last_mic_chunk = self.mic_buffer[:N]
+        #         self.mic_buffer = self.mic_buffer[N:]
+        #         self.callback(last_mic_chunk, channel="mic")
+
+        # # 先处理所有系统数据，缓存最后一个块用于元数据上报
+        # last_sys_chunk = None
+        # if has_sys:
+        #     while len(self.sys_buffer) >= N:
+        #         last_sys_chunk = self.sys_buffer[:N]
+        #         self.sys_buffer = self.sys_buffer[N:]
+        #         self.callback(last_sys_chunk, channel="system")
+
+        # # 用最后一个块上报元数据（至少有一个块才上报）
+        # if last_mic_chunk is not None or last_sys_chunk is not None:
+        #     self._emit_source_meta(last_mic_chunk, last_sys_chunk)
 
         if has_mic and has_sys:
             while len(self.mic_buffer) >= N and len(self.sys_buffer) >= N:
@@ -287,14 +307,14 @@ class AudioCapture:
         if self.is_running:
             self.mic_buffer += in_data
             self._trim_buffers()
-            self._mix_and_send()
+            self._send_audio()
         return (None, pyaudio.paContinue)
 
     def _sys_callback(self, in_data, frame_count, time_info, status):
         if self.is_running:
             self.sys_buffer += self._sys_to_16k_mono(in_data)
             self._trim_buffers()
-            self._mix_and_send()
+            self._send_audio()
         return (None, pyaudio.paContinue)
 
     def stop(self):

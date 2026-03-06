@@ -94,9 +94,9 @@ def test_audio_capture_mixing_logic():
                 # CHUNK_16K = 3200 帧, N = 6400 字节
                 data = b"\x01" * 6400
                 ac.mic_buffer = data
-                ac._mix_and_send()
+                ac._send_audio()
 
-                mock_cb.assert_called_once_with(data)
+                mock_cb.assert_called_once_with(data, channel="mic")
                 assert len(ac.mic_buffer) == 0
 
 
@@ -112,7 +112,7 @@ def test_audio_capture_system_only_fallback():
                 ac.sys_stream = object()
                 data = b"\x02" * 6400
                 ac.sys_buffer = data
-                ac._mix_and_send()
+                ac._send_audio()
 
-                mock_cb.assert_called_once_with(data)
+                mock_cb.assert_called_once_with(data, channel="system")
                 assert len(ac.sys_buffer) == 0

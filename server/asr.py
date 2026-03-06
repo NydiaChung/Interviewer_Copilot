@@ -54,6 +54,7 @@ class ASRProvider(abc.ABC):
         pass
 
 
+# === 基于豆包（ByteDance）的 ASR 实现 ===
 class DoubaoProvider(ASRProvider):
     """豆包 (ByteDance) 流式 ASR 实现"""
 
@@ -306,74 +307,256 @@ class DoubaoProvider(ASRProvider):
             self._thread.join(timeout=2)
 
 
-class AliyunProvider(ASRProvider):
-    """阿里云 (DashScope/Paraformer) 实现"""
+class TingwuProvider(ASRProvider):
+    """通义听悟（阿里云）实时 ASR 实现 —— 支持说话人分离
+
+    生命周期：
+      1. start()  → REST CreateTask 获取 MeetingJoinUrl + NLS SDK 建立推流
+      2. add_audio() → 透传 PCM 给 NLS
+      3. stop()  → NLS stop + REST 结束任务
+    """
+
+    TINGWU_ENDPOINT = "tingwu.cn-beijing.aliyuncs.com"
+    TINGWU_API_VERSION = "2023-09-30"
 
     def __init__(self):
         super().__init__()
-        import dashscope
-        from dashscope.audio.asr import Recognition
+        self._ak_id = os.getenv("TINGWU_ACCESS_KEY_ID", "")
+        self._ak_secret = os.getenv("TINGWU_ACCESS_KEY_SECRET", "")
+        self._app_key = os.getenv("TINGWU_APP_KEY", "")
+        self._speaker_count = int(os.getenv("TINGWU_SPEAKER_COUNT", "2"))
+        self._task_id = None
+        self._meeting_url = None
+        self._rm = None  # NlsRealtimeMeeting 实例
+        self._thread = None
+        self._ready_event = threading.Event()
+        self.last_speaker_id = None  # 最近一次识别到的说话人 ID
 
-        self.Recognition = Recognition
-        self.recognition = None
-        self.api_key = os.getenv("DASHSCOPE_API_KEY")
+    # ── REST API 辅助 ──
+
+    def _create_realtime_task(self) -> tuple:
+        """调用 CreateTask 创建实时记录任务，返回 (task_id, meeting_join_url)"""
+        from aliyunsdkcore.client import AcsClient
+        from aliyunsdkcore.request import CommonRequest
+
+        client = AcsClient(self._ak_id, self._ak_secret, "cn-beijing")
+        request = CommonRequest()
+        request.set_domain(self.TINGWU_ENDPOINT)
+        request.set_version(self.TINGWU_API_VERSION)
+        request.set_protocol_type("https")
+        request.set_method("PUT")
+        request.set_uri_pattern("/openapi/tingwu/v2/tasks")
+        request.add_query_param("type", "realtime")
+        request.set_content_type("application/json")
+
+        body = {
+            "AppKey": self._app_key,
+            "Input": {
+                "SourceLanguage": "cn",
+                "Format": "pcm",
+                "SampleRate": 16000,
+                "TaskKey": f"interview_{uuid.uuid4().hex[:8]}",
+            },
+            "Parameters": {
+                "Transcription": {
+                    "OutputLevel": 2,  # 返回中间结果 + 完整句子
+                    "DiarizationEnabled": True,
+                    "Diarization": {
+                        "SpeakerCount": self._speaker_count,
+                    },
+                },
+            },
+        }
+        request.set_content(json.dumps(body).encode("utf-8"))
+
+        response = client.do_action_with_exception(request)
+        resp = json.loads(response)
+        print(f"[ASR-Tingwu] CreateTask 响应: {json.dumps(resp, ensure_ascii=False)}")
+
+        data = resp.get("Data", {})
+        task_id = data.get("TaskId", "")
+        meeting_url = data.get("MeetingJoinUrl", "")
+        if not task_id or not meeting_url:
+            raise RuntimeError(f"CreateTask 失败: {resp}")
+        return task_id, meeting_url
+
+    def _stop_realtime_task(self):
+        """调用 CreateTask(operation=stop) 结束实时记录"""
+        if not self._task_id:
+            return
+        try:
+            from aliyunsdkcore.client import AcsClient
+            from aliyunsdkcore.request import CommonRequest
+
+            client = AcsClient(self._ak_id, self._ak_secret, "cn-beijing")
+            request = CommonRequest()
+            request.set_domain(self.TINGWU_ENDPOINT)
+            request.set_version(self.TINGWU_API_VERSION)
+            request.set_protocol_type("https")
+            request.set_method("PUT")
+            request.set_uri_pattern("/openapi/tingwu/v2/tasks")
+            request.add_query_param("type", "realtime")
+            request.add_query_param("operation", "stop")
+            request.set_content_type("application/json")
+
+            body = {"Input": {"TaskId": self._task_id}}
+            request.set_content(json.dumps(body).encode("utf-8"))
+
+            response = client.do_action_with_exception(request)
+            print(f"[ASR-Tingwu] 任务已结束: {response.decode('utf-8')}")
+        except Exception as e:
+            print(f"[ASR-Tingwu] 结束任务异常: {e}")
+
+    # ── NLS 回调 ──
+
+    def _on_start(self, message, *args):
+        print(f"[ASR-Tingwu] 推流已建立: {message}")
+        self._ready_event.set()
+
+    def _on_sentence_begin(self, message, *args):
+        try:
+            data = json.loads(message) if isinstance(message, str) else {}
+            speaker = data.get("payload", {}).get("speaker_id")
+            if speaker is not None:
+                self.last_speaker_id = str(speaker)
+            print(
+                f"[ASR-Tingwu] SentenceBegin: index={data.get('payload', {}).get('index')} speaker={speaker}"
+            )
+        except Exception:
+            pass
+
+    def _on_result_changed(self, message, *args):
+        """中间结果 → on_text_update(text, False)"""
+        try:
+            data = json.loads(message) if isinstance(message, str) else {}
+            payload = data.get("payload", {})
+            text = payload.get("result", "")
+            speaker = payload.get("speaker_id")
+            if speaker is not None:
+                self.last_speaker_id = str(speaker)
+            if text and self.on_text_update and self.loop:
+                asyncio.run_coroutine_threadsafe(
+                    self.on_text_update(text, False), self.loop
+                )
+        except Exception as e:
+            print(f"[ASR-Tingwu] ResultChanged 解析异常: {e}")
+
+    def _on_sentence_end(self, message, *args):
+        """句子结束 → on_text_update(text, True)"""
+        try:
+            data = json.loads(message) if isinstance(message, str) else {}
+            payload = data.get("payload", {})
+            text = payload.get("result", "")
+            speaker = payload.get("speaker_id")
+            if speaker is not None:
+                self.last_speaker_id = str(speaker)
+
+            # 拼接 stash_result（暂存的下一句开头）
+            stash = payload.get("stash_result", {})
+            stash_text = stash.get("text", "") if stash else ""
+
+            full_text = text
+            if stash_text:
+                full_text = text + stash_text
+
+            print(
+                f"[ASR-Tingwu] SentenceEnd: speaker={speaker} text={text} stash={stash_text}"
+            )
+
+            if full_text and self.on_text_update and self.loop:
+                asyncio.run_coroutine_threadsafe(
+                    self.on_text_update(full_text, True), self.loop
+                )
+        except Exception as e:
+            print(f"[ASR-Tingwu] SentenceEnd 解析异常: {e}")
+
+    def _on_completed(self, message, *args):
+        print(f"[ASR-Tingwu] 识别完成: {message}")
+
+    def _on_error(self, message, *args):
+        print(f"[ASR-Tingwu] 错误: {message}")
+
+    def _on_close(self, *args):
+        print("[ASR-Tingwu] 连接关闭")
+
+    # ── 主推流线程 ──
+
+    def _run_nls(self):
+        """在独立线程中运行 NLS 推流"""
+        try:
+            import nls
+
+            self._rm = nls.NlsRealtimeMeeting(
+                url=self._meeting_url,
+                on_sentence_begin=self._on_sentence_begin,
+                on_sentence_end=self._on_sentence_end,
+                on_start=self._on_start,
+                on_result_changed=self._on_result_changed,
+                on_completed=self._on_completed,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            self._rm.start()
+        except Exception as e:
+            print(f"[ASR-Tingwu] NLS 启动异常: {e}")
+            self._ready_event.set()  # 解除等待
+
+    # ── ASRProvider 接口实现 ──
 
     def start(self):
-        if not self.api_key:
-            raise ValueError("DASHSCOPE_API_KEY 缺失")
-        import dashscope
+        if self.is_started:
+            return
+        if not self._ak_id or not self._ak_secret or not self._app_key:
+            raise ValueError(
+                "TINGWU 配置缺失 (TINGWU_ACCESS_KEY_ID / TINGWU_ACCESS_KEY_SECRET / TINGWU_APP_KEY)"
+            )
 
-        dashscope.api_key = self.api_key
+        # 1. REST 创建任务
+        self._task_id, self._meeting_url = self._create_realtime_task()
+        print(f"[ASR-Tingwu] TaskId={self._task_id}")
+        print(f"[ASR-Tingwu] MeetingJoinUrl={self._meeting_url[:80]}...")
 
-        from dashscope.audio.asr import RecognitionCallback, RecognitionResult
+        # 2. NLS 推流（在独立线程中）
+        self._ready_event.clear()
+        self._thread = threading.Thread(target=self._run_nls, daemon=True)
+        self._thread.start()
 
-        class LocalCallback(RecognitionCallback):
-            def __init__(self, outer):
-                super().__init__()
-                self.outer = outer
+        if not self._ready_event.wait(timeout=10):
+            raise RuntimeError("ASR-Tingwu 推流建立超时")
 
-            def on_event(self, res: RecognitionResult):
-                text = (
-                    res.get_sentence().get("text", "")
-                    if isinstance(res.get_sentence(), dict)
-                    else str(res.get_sentence())
-                )
-                if text and self.outer.on_text_update and self.outer.loop:
-                    asyncio.run_coroutine_threadsafe(
-                        self.outer.on_text_update(text, res.is_sentence_end()),
-                        self.outer.loop,
-                    )
-
-            def on_error(self, res):
-                print(f"[ASR-Ali] ERR: {res}")
-
-            def on_close(self):
-                print("[ASR-Ali] Closed")
-
-        self.recognition = self.Recognition(
-            model="paraformer-realtime-v2",
-            format="pcm",
-            sample_rate=16000,
-            callback=LocalCallback(self),
-        )
-        self.recognition.start()
         self.is_started = True
-        print("[ASR] Aliyun 提供商已启动")
+        print(f"[ASR] 通义听悟提供商已启动 (说话人分离={self._speaker_count}人)")
 
     def add_audio(self, chunk: bytes):
-        if self.is_started and self.recognition:
-            self.recognition.send_audio_frame(chunk)
+        if self.is_started and self._rm:
+            try:
+                self._rm.send_audio(chunk)
+            except Exception as e:
+                print(f"[ASR-Tingwu] 发送音频失败: {e}")
 
     def stop(self):
-        if self.is_started and self.recognition:
-            self.recognition.stop()
-            self.is_started = False
+        if not self.is_started:
+            return
+        self.is_started = False
+
+        # 1. 停止 NLS 推流
+        if self._rm:
+            try:
+                self._rm.stop()
+            except Exception as e:
+                print(f"[ASR-Tingwu] NLS stop 异常: {e}")
+
+        # 2. REST 结束任务
+        self._stop_realtime_task()
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
 
 
 # ── 工厂实例化 ──
 def get_asr_processor() -> ASRProvider:
-    if PROVIDER == "aliyun":
-        return AliyunProvider()
+    if PROVIDER == "tingwu":
+        return TingwuProvider()
     return DoubaoProvider()
 
 
