@@ -32,13 +32,13 @@ print(f"[ENV] DOUBAO_APP_ID={os.getenv('DOUBAO_APP_ID', '(未设置)')}")
 
 
 try:
-    from server.asr import get_asr_processor
+    from server.asr import DoubaoProvider, TingwuProvider, get_asr_processor
     from server.intent import IntentReadinessDetector, is_question_like
     from server.llm import llm_processor
     from server.voiceprint import VoiceprintTracker
 except ModuleNotFoundError:
     # Fallback for running from server/ directory directly.
-    from asr import get_asr_processor
+    from asr import DoubaoProvider, TingwuProvider, get_asr_processor
     from intent import IntentReadinessDetector, is_question_like
     from llm import llm_processor
     from voiceprint import VoiceprintTracker
@@ -67,6 +67,7 @@ QUESTION_FORCE_CLOSE_SECONDS = 2.6
 NEW_QUESTION_SIMILARITY_THRESHOLD = 0.45
 VOICEPRINT_SWITCH_MIN_GAP_SECONDS = 0.35
 VOICEPRINT_SWITCH_SIMILARITY_THRESHOLD = 0.72
+#
 ANSWER_STREAM_INTERVAL_SECONDS = 0.04
 # 声纹换人后，满足该沉默时间即强制关闭问题并触发回答
 VOICEPRINT_CLOSE_SILENCE_SECONDS = 0.35
@@ -81,6 +82,9 @@ SPEAKER_CONFIRM_MAX_GAP_SECONDS = 0.5
 # tracing 开关与采样
 TRACE_ENABLED = os.getenv("TRACE_ENABLED", "1").lower() not in ("0", "false", "off")
 TRACE_AUDIO_SAMPLE_EVERY = int(os.getenv("TRACE_AUDIO_SAMPLE_EVERY", "80"))
+ASR_STALL_ACTIVE_FRAMES = int(os.getenv("ASR_STALL_ACTIVE_FRAMES", "35"))
+ASR_RESTART_COOLDOWN_SECONDS = float(os.getenv("ASR_RESTART_COOLDOWN_SECONDS", "8.0"))
+CANDIDATE_ASR_RETRY_SECONDS = float(os.getenv("CANDIDATE_ASR_RETRY_SECONDS", "6.0"))
 # 音源角色判定（desktop_app 上报）：system≈面试官，mic≈应聘者
 SOURCE_ACTIVITY_FRESH_SECONDS = 1.2
 SOURCE_TAKEOVER_CLOSE_WINDOW_SECONDS = 1.8
@@ -250,6 +254,10 @@ async def audio_websocket(websocket: WebSocket):
     # tracing state
     trace_seq = 0
     last_new_turn_eval = {"trigger": False, "reason": "init"}
+    # 主 ASR 稳定性监控：若持续活跃音频但长期没有文本回调，则触发重连
+    main_active_frames_since_text = 0
+    main_last_text_ts = 0.0
+    last_main_asr_restart_ts = 0.0
 
     # We will need the event loop for the async callback
     loop = asyncio.get_running_loop()
@@ -273,6 +281,42 @@ async def audio_websocket(websocket: WebSocket):
             print(f"[Trace] {event} {fields}")
 
     _trace("ws_session_started")
+
+    class _NoopASR:
+        """ASR 不可用时的占位实现，保持会话不断开。"""
+
+        last_speaker_id = None
+        last_speaker_name = None
+
+        def set_callback(self, callback, loop):
+            return
+
+        def start(self):
+            return
+
+        def add_audio(self, chunk: bytes):
+            return
+
+        def stop(self):
+            return
+
+    asr_warning_last_ts = 0.0
+
+    async def _notify_asr_unavailable(message: str):
+        nonlocal asr_warning_last_ts
+        now = time.monotonic()
+        if (now - asr_warning_last_ts) < 6.0:
+            return
+        asr_warning_last_ts = now
+        with suppress(Exception):
+            await websocket.send_json(
+                {
+                    "type": "incremental",
+                    "text": message,
+                    "speaker_role": "interviewer",
+                    "trace_id": trace_id,
+                }
+            )
 
     def _create_turn(
         text: str, normalized: str, now_ts: float, speaker_id: int | None = None
@@ -306,12 +350,20 @@ async def audio_websocket(websocket: WebSocket):
         )
 
     def _current_dominant_speaker(now_ts: float) -> int | None:
+        if getattr(asr_processor, "last_speaker_id", None) is not None:
+            return getattr(asr_processor, "last_speaker_id")
         speaker_id = voiceprint_tracker.dominant_speaker(now_ts)
         if speaker_id is not None:
             return speaker_id
         return last_dominant_speaker
 
     def _current_source_role(now_ts: float) -> str:
+        # 听悟模式下：直接采用端到端的角色识别
+        speaker_name = getattr(asr_processor, "last_speaker_name", None)
+        if speaker_name in ["interviewer", "candidate"]:
+            return speaker_name
+
+        # 兼容旧逻辑/豆包模式下的本地音量反馈
         last_ts = float(source_activity.get("ts", 0.0) or 0.0)
         if last_ts <= 0 or (now_ts - last_ts) > SOURCE_ACTIVITY_FRESH_SECONDS:
             return "unknown"
@@ -734,10 +786,19 @@ async def audio_websocket(websocket: WebSocket):
 
     # 双通道特性：独立的候选人 ASR 会议
     asr_candidate = None
+    candidate_last_start_attempt_ts = 0.0
 
     def _ensure_asr_candidate():
-        nonlocal asr_candidate
+        nonlocal asr_candidate, candidate_last_start_attempt_ts
         if asr_candidate is None:
+            now = time.monotonic()
+            if (
+                candidate_last_start_attempt_ts > 0
+                and (now - candidate_last_start_attempt_ts)
+                < CANDIDATE_ASR_RETRY_SECONDS
+            ):
+                return
+            candidate_last_start_attempt_ts = now
             print("[ASR] Initializing dedicated Candidate ASR session...")
             asr_candidate = get_asr_processor()
             asr_candidate.set_callback(
@@ -747,26 +808,35 @@ async def audio_websocket(websocket: WebSocket):
                 asr_candidate.start()
             except Exception as e:
                 print(f"[ASR] Failed to start Candidate ASR: {e}")
+                _trace("candidate_asr_start_failed", error=str(e))
+                asr_candidate = None
 
-    def on_candidate_text_update(text: str, is_sentence_end: bool):
+    async def on_candidate_text_update(text: str, is_sentence_end: bool):
         """专用于候选人音频通道的回调，仅做字幕展示和转写记录，不干扰主流程"""
         if not text:
             return
 
+        print(f"[Callback-Candidate] Received: {text} (is_end={is_sentence_end})")
+
         # 为了展示，仍然发送给前端
         # 由于我们这里没有 "current_turn"，每次当做独立的增量（或全量覆盖）
         # 简单起见，利用独立的 trace_id 或直接发送
-        asyncio.create_task(
-            websocket.send_json(
-                {
-                    "type": "incremental",
-                    "text": text,
-                    "question_id": -1,  # 使用固定的或特殊的 ID 表示独立的候选人流
-                    "speaker_id": None,
-                    "speaker_role": "candidate",
-                    "trace_id": f"{trace_id}-cand",
-                }
-            )
+        await websocket.send_json(
+            {
+                "type": "incremental",
+                "text": text,
+                "question_id": -1,  # 使用固定的或特殊的 ID 表示独立的候选人流
+                "speaker_id": None,
+                "speaker_role": "candidate",
+                "trace_id": f"{trace_id}-cand",
+            }
+        )
+        _trace(
+            "ws_incremental_sent",
+            stream="candidate",
+            speaker_role="candidate",
+            question_id=-1,
+            text_preview=text[:80],
         )
 
         if is_sentence_end:
@@ -782,11 +852,16 @@ async def audio_websocket(websocket: WebSocket):
                 }
             )
 
+    speaker_mapping_state = {}
+
     async def on_text_update(text: str, is_sentence_end: bool):
         """Callback fired by the ASR processor when new text is recognized."""
         nonlocal current_turn, outline_task, _asr_global_text
+        nonlocal main_active_frames_since_text, main_last_text_ts
         if not text:
             return
+
+        print(f"[Callback-Main] Received: {text} (is_end={is_sentence_end})")
 
         # 记录豆包 ASR 返回的全局累积文本
         _asr_global_text = text
@@ -801,17 +876,27 @@ async def audio_websocket(websocket: WebSocket):
                 inc = ft[len(bl) :].strip()
                 return inc if inc else ft
             # ASR 重识别导致全文变化，取最后一句作为增量兜底
-            parts = [
-                s.strip()
-                for s in ft.replace("\uff0c", "\u3002").split("\u3002")
-                if s.strip()
-            ]
+            parts = [s.strip() for s in ft.replace("，", "。").split("。") if s.strip()]
             return parts[-1] if parts else ft
 
         now_ts = time.monotonic()
+        main_last_text_ts = now_ts
+        main_active_frames_since_text = 0
         normalized = _normalize_text(text)
-        incoming_speaker = _current_dominant_speaker(now_ts)
-        source_role = _current_source_role(now_ts)
+        # incoming_speaker = _current_dominant_speaker(now_ts)
+        # source_role = _current_source_role(now_ts)
+
+        # 1. 摒弃本地音源判定，全量使用云端 speaker_id
+        incoming_speaker = getattr(asr_processor, "last_speaker_id", None)
+        speaker_name = getattr(asr_processor, "last_speaker_name", None)
+
+        if speaker_name in ["interviewer", "candidate"]:
+            speaker_mapping_state[incoming_speaker] = speaker_name
+            source_role = speaker_name
+        else:
+            # 默认兜底机制：如果没有 Name，先将当前说话人暂定为 interviewer 以保证文本能在前端展示
+            source_role = speaker_mapping_state.get(incoming_speaker, "interviewer")
+
         _trace(
             "asr_text_update",
             current_turn_id=(current_turn.get("id") if current_turn else None),
@@ -823,7 +908,7 @@ async def audio_websocket(websocket: WebSocket):
         )
 
         # 候选人音源主导时，跳过"问题识别"链路，避免把回答当成下一题。
-        # 但仍发送 incremental 帧给前端用于字幕显示。
+        # 2. 取消静默拦截：无论是候选人还是面试官说话，所有增量文本 (incremental) 必须无脑广播给前端
         if source_role == "candidate":
             # 提取候选人增量文本用于字幕
             candidate_text = text  # 默认用原始文本
@@ -840,6 +925,13 @@ async def audio_websocket(websocket: WebSocket):
                         "speaker_role": "candidate",
                         "trace_id": trace_id,
                     }
+                )
+                _trace(
+                    "ws_incremental_sent",
+                    stream="main",
+                    speaker_role="candidate",
+                    question_id=(current_turn.get("id") if current_turn else None),
+                    text_preview=(candidate_text or text)[:80],
                 )
             except Exception:
                 pass
@@ -908,18 +1000,19 @@ async def audio_websocket(websocket: WebSocket):
         inc_text_now = _extract_increment(text, baseline_now)
         normalized = _normalize_text(inc_text_now) or normalized
 
-        if is_sentence_end:
-            current_turn["got_final"] = True
-            _trace(
-                "asr_sentence_end",
-                turn_id=current_turn.get("id"),
-                text_preview=(current_turn.get("text", "") or text)[:80],
-            )
-            # 关键：句末直接关题，不再发送 incremental。
-            await _maybe_close_turn(
-                current_turn.get("id"), reason="asr_final", force=True
-            )
-            return
+        # 之前为了测试注释掉的代码，需恢复工作：
+        # if is_sentence_end:
+        #     current_turn["got_final"] = True
+        #     _trace(
+        #         "asr_sentence_end",
+        #         turn_id=current_turn.get("id"),
+        #         text_preview=(current_turn.get("text", "") or text)[:80],
+        #     )
+        #     # 关键：句末直接关题，不再发送 incremental。
+        #     await _maybe_close_turn(
+        #         current_turn.get("id"), reason="asr_final", force=True
+        #     )
+        #     return
 
         # Send incremental text with question_id for debug/traceability.
         # 注意：发送「本轮增量文本」而非 ASR 全局累积文本，
@@ -935,8 +1028,29 @@ async def audio_websocket(websocket: WebSocket):
                     "trace_id": trace_id,
                 }
             )
+            _trace(
+                "ws_incremental_sent",
+                stream="main",
+                speaker_role=source_role,
+                question_id=current_turn.get("id"),
+                text_preview=(current_turn.get("text", "") or text)[:80],
+            )
         except Exception:
             pass
+
+        if is_sentence_end:
+            current_turn["got_final"] = True
+            _trace(
+                "asr_sentence_end",
+                turn_id=current_turn.get("id"),
+                text_preview=(current_turn.get("text", "") or text)[:80],
+            )
+            # 听悟虽然判断了句子结束（VAD停顿），业务仍然执行原有的强制关闭触发。
+            # 若后续发现切分过碎可去掉 force=True 让外部任务管理。
+            await _maybe_close_turn(
+                current_turn.get("id"), reason="asr_final", force=True
+            )
+            return
 
         # Early draft outline: one shot per question.
         if (
@@ -998,16 +1112,66 @@ async def audio_websocket(websocket: WebSocket):
 
         _arm_close_check(current_turn.get("id"))
 
+    async def _start_main_asr_with_fallback(reason: str) -> bool:
+        """启动主 ASR。听悟失败时自动回退豆包；都失败则降级为手动模式。"""
+        nonlocal asr_processor
+        provider = get_asr_processor()
+        provider_name = provider.__class__.__name__
+        provider.set_callback(on_text_update, loop)
+        try:
+            provider.start()
+            asr_processor = provider
+            _trace("asr_started", reason=reason, provider=provider_name)
+            return True
+        except Exception as primary_err:
+            print(f"[ASR] Failed to start ASR({provider_name}): {primary_err}")
+            _trace(
+                "asr_start_failed",
+                reason=reason,
+                provider=provider_name,
+                error=str(primary_err),
+            )
+
+        if isinstance(provider, TingwuProvider):
+            fallback = DoubaoProvider()
+            fallback_name = fallback.__class__.__name__
+            fallback.set_callback(on_text_update, loop)
+            try:
+                fallback.start()
+                asr_processor = fallback
+                _trace(
+                    "asr_fallback_started",
+                    reason=reason,
+                    from_provider=provider_name,
+                    to_provider=fallback_name,
+                )
+                await _notify_asr_unavailable(
+                    "⚠️ 听悟连接失败，已自动切换备用语音识别。"
+                )
+                return True
+            except Exception as fallback_err:
+                print(
+                    f"[ASR] Fallback start failed ({provider_name}->{fallback_name}): {fallback_err}"
+                )
+                _trace(
+                    "asr_fallback_failed",
+                    reason=reason,
+                    from_provider=provider_name,
+                    to_provider=fallback_name,
+                    error=str(fallback_err),
+                )
+
+        asr_processor = _NoopASR()
+        await _notify_asr_unavailable(
+            "⚠️ 语音识别暂不可用（网络/证书异常）。你仍可在输入框手动提问。"
+        )
+        return False
+
     # Initialize and start ASR stream (per-connection instance; do not share globally)
-    asr_processor = get_asr_processor()
-    asr_processor.set_callback(on_text_update, loop)
-    try:
-        asr_processor.start()
-    except Exception as e:
-        print(f"[ASR] Failed to start ASR: {e}")
-        await websocket.close()
-        wave_file.close()
-        return
+    asr_processor = _NoopASR()
+    asr_available = await _start_main_asr_with_fallback(reason="session_init")
+    if not asr_available:
+        print("[ASR] Main ASR unavailable for this session; manual mode only.")
 
     try:
         _recv_count = 0
@@ -1015,10 +1179,21 @@ async def audio_websocket(websocket: WebSocket):
             # Receive audio chunk (binary) or command (text)
             message = await websocket.receive()
 
+            # [HOTFIX DEBUG]: 把 message 结构打出来看看
+            if "bytes" in message:
+                if _recv_count % 100 == 1:
+                    print(
+                        f"[WS-DEBUG] ASGI received dict with 'bytes' length: {len(message.get('bytes', b''))}"
+                    )
+            elif "text" in message:
+                txt = message["text"]
+                if '"source_activity"' not in txt:
+                    print(f"[WS-DEBUG] ASGI received dict with 'text': {txt[:80]}")
+
             data_bytes = None
             is_candidate_channel = False
 
-            if "bytes" in message:
+            if "bytes" in message and message["bytes"] is not None:
                 data_bytes = message["bytes"]
             elif "text" in message:
                 text_data = message["text"]
@@ -1191,7 +1366,14 @@ async def audio_websocket(websocket: WebSocket):
                     if _recv_count % 100 == 1:
                         print(f"[WS] Candidate audio frame size={len(data)}B")
                     _ensure_asr_candidate()
-                    asr_candidate.add_audio(data)
+                    if asr_candidate is not None:
+                        asr_candidate.add_audio(data)
+                    elif _recv_count % 60 == 1:
+                        _trace(
+                            "candidate_asr_unavailable_drop",
+                            frame_bytes=len(data),
+                            recv_count=_recv_count,
+                        )
                     # 不参与主路录音 wave_file、不参与主路的音频活跃/声纹检测
                     continue
 
@@ -1248,6 +1430,46 @@ async def audio_websocket(websocket: WebSocket):
 
                 if current_turn and not current_turn.get("closed") and is_active_audio:
                     current_turn["audio_last_ts"] = now_ts
+                if is_active_audio:
+                    main_active_frames_since_text += 1
+                # 主 ASR 疑似卡死：持续活跃音频但长期无文本回调，尝试自动重启。
+                source_role_now = _current_source_role(now_ts)
+                if (
+                    is_active_audio
+                    and source_role_now != "candidate"
+                    and main_active_frames_since_text >= ASR_STALL_ACTIVE_FRAMES
+                    and (now_ts - last_main_asr_restart_ts)
+                    >= ASR_RESTART_COOLDOWN_SECONDS
+                ):
+                    since_last_text = (
+                        now_ts - main_last_text_ts if main_last_text_ts > 0 else None
+                    )
+                    _trace(
+                        "asr_stall_detected",
+                        recv_count=_recv_count,
+                        active_frames_since_text=main_active_frames_since_text,
+                        since_last_text=(
+                            round(since_last_text, 3)
+                            if since_last_text is not None
+                            else None
+                        ),
+                        source_role=source_role_now,
+                        rms=rms,
+                        turn_id=(current_turn.get("id") if current_turn else None),
+                    )
+                    try:
+                        asr_processor.stop()
+                    except Exception:
+                        pass
+                    restarted = await _start_main_asr_with_fallback(
+                        reason="stall_restart"
+                    )
+                    main_active_frames_since_text = 0
+                    last_main_asr_restart_ts = now_ts
+                    if restarted:
+                        _trace("asr_restarted", recv_count=_recv_count)
+                    else:
+                        _trace("asr_restart_failed", recv_count=_recv_count)
                 elif current_turn and not current_turn.get("closed"):
                     # 如果不是 active audio，观察一下静默累计
                     silence = now_ts - current_turn.get("audio_last_ts", now_ts)
@@ -1268,128 +1490,6 @@ async def audio_websocket(websocket: WebSocket):
                         rms=rms,
                         frame_bytes=len(data),
                     )
-            elif "text" in message:
-                text_data = message["text"]
-                print(f"[WS] Received text frame: {text_data[:80]}")
-
-                try:
-                    cmd_json = json.loads(text_data)
-                    if cmd_json.get("command") == "end_session":
-                        _trace("command_end_session")
-                        print(
-                            f"[Memory] Session ended by user. Generating analysis for: {session_id}"
-                        )
-                        # Stop ASR first so no more late transcripts are appended.
-                        asr_processor.stop()
-
-                        if close_check_task and not close_check_task.done():
-                            close_check_task.cancel()
-                        if outline_task and not outline_task.done():
-                            outline_task.cancel()
-                        if current_turn and not current_turn.get("closed"):
-                            await _maybe_close_turn(
-                                current_turn.get("id"),
-                                reason="session_end",
-                                force=True,
-                            )
-
-                        # 等待已触发但未完成的回答任务，确保复盘包含最新回答
-                        pending_answers = [
-                            task for task in answer_tasks if not task.done()
-                        ]
-                        if pending_answers:
-                            await asyncio.gather(
-                                *pending_answers, return_exceptions=True
-                            )
-
-                        # Format history for LLM
-                        history_text = _build_history_text()
-
-                        # Generate Analysis
-                        analysis = await _call_with_timeout(
-                            llm_processor.generate_analysis(
-                                jd=JD_TEXT, resume=RESUME_TEXT, history=history_text
-                            ),
-                            timeout_seconds=LLM_ANALYSIS_TIMEOUT_SECONDS,
-                            fallback_text=ANALYSIS_FALLBACK_TEXT,
-                        )
-
-                        # Save Transcript + Analysis
-                        with open(transcript_file_path, "w", encoding="utf-8") as f:
-                            json.dump(
-                                {
-                                    "jd": JD_TEXT,
-                                    "resume": RESUME_TEXT,
-                                    "history": _sorted_transcript(),
-                                    "analysis": analysis,
-                                },
-                                f,
-                                ensure_ascii=False,
-                                indent=2,
-                            )
-
-                        # Send analysis back to client and close this session loop.
-                        await websocket.send_json(
-                            {
-                                "type": "analysis",
-                                "answer": analysis,
-                                "trace_id": trace_id,
-                            }
-                        )
-                        break
-                    elif cmd_json.get("command") == "source_activity":
-                        now_ts = time.monotonic()
-                        dominant = str(
-                            cmd_json.get(
-                                "dominant_source",
-                                source_activity.get("dominant_source", "unknown"),
-                            )
-                        )
-                        prev_dominant = str(
-                            source_activity.get("dominant_source", "unknown")
-                        )
-                        source_activity["dominant_source"] = dominant
-                        source_activity["mic_rms"] = int(
-                            cmd_json.get("mic_rms", 0) or 0
-                        )
-                        source_activity["system_rms"] = int(
-                            cmd_json.get("system_rms", 0) or 0
-                        )
-                        source_activity["ts"] = now_ts
-                        if dominant != prev_dominant:
-                            source_activity["change_ts"] = now_ts
-                        _trace(
-                            "source_activity",
-                            dominant_source=dominant,
-                            mic_rms=source_activity["mic_rms"],
-                            system_rms=source_activity["system_rms"],
-                            changed=(dominant != prev_dominant),
-                        )
-                    elif cmd_json.get("command") == "manual_question":
-                        # 用户通过悬浮窗输入框手动提问
-                        manual_text = cmd_json.get("text", "").strip()
-                        if manual_text:
-                            _trace(
-                                "command_manual_question",
-                                text_preview=manual_text[:80],
-                            )
-                            print(f"[Manual] User sent: {manual_text}")
-                            if close_check_task and not close_check_task.done():
-                                close_check_task.cancel()
-                            intent_detector.reset()
-                            if outline_task and not outline_task.done():
-                                outline_task.cancel()
-                            if current_turn and not current_turn.get("closed"):
-                                await _maybe_close_turn(
-                                    current_turn.get("id"),
-                                    reason="manual_interrupt",
-                                    force=True,
-                                )
-                            _schedule_answer(manual_text, source="manual")
-
-                except Exception as e:
-                    print(f"[WS] Error processing text command: {e}")
-
     except WebSocketDisconnect:
         _trace("ws_client_disconnected")
         print("[WS] Client disconnected")

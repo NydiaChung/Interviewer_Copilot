@@ -96,7 +96,7 @@ def test_audio_capture_mixing_logic():
                 ac.mic_buffer = data
                 ac._send_audio()
 
-                mock_cb.assert_called_once_with(data, channel="mic")
+                mock_cb.assert_called_once_with(data)
                 assert len(ac.mic_buffer) == 0
 
 
@@ -114,5 +114,24 @@ def test_audio_capture_system_only_fallback():
                 ac.sys_buffer = data
                 ac._send_audio()
 
-                mock_cb.assert_called_once_with(data, channel="system")
+                mock_cb.assert_called_once_with(data)
                 assert len(ac.sys_buffer) == 0
+
+
+def test_audio_capture_dual_stream_fallback_routes_mic_to_main_when_no_system_device():
+    mock_cb = MagicMock()
+    with patch("pyaudio.PyAudio"):
+        with patch("desktop_app.audio_capture.PYAUDIO_OK", True):
+            # 无 system 设备：双流应自动降级为 mic -> system(main)
+            with patch(
+                "desktop_app.audio_capture._find_devices",
+                return_value=(0, None, 1, 16000),
+            ):
+                ac = AudioCapture(mock_cb, dual_stream_mode=True)
+                ac.mic_stream = object()
+                data = b"\x03" * 6400
+                ac.mic_buffer = data
+                ac._send_audio()
+
+                mock_cb.assert_called_once_with(data, channel="system")
+                assert len(ac.mic_buffer) == 0

@@ -15,7 +15,7 @@ import abc
 import websockets
 
 # ── 认证信息从 .env 加载 ──
-PROVIDER = os.getenv("ASR_PROVIDER", "doubao").lower()
+PROVIDER = os.getenv("ASR_PROVIDER", "tingwu").lower()
 
 # 豆包配置
 DOUBAO_APP_ID = os.getenv("DOUBAO_APP_ID", "")
@@ -365,6 +365,20 @@ class TingwuProvider(ASRProvider):
                         "SpeakerCount": self._speaker_count,
                     },
                 },
+                "IdentityRecognitionEnabled": True,
+                "IdentityRecognition": {
+                    "SceneIntroduction": "这是一场在线技术面试",
+                    "IdentityContents": [
+                        {
+                            "Name": "interviewer",
+                            "Description": "面试官，负责提出面试问题和考察候选人",
+                        },
+                        {
+                            "Name": "candidate",
+                            "Description": "应聘者，负责回答面试官提出的问题",
+                        },
+                    ],
+                },
             },
         }
         request.set_content(json.dumps(body).encode("utf-8"))
@@ -416,11 +430,19 @@ class TingwuProvider(ASRProvider):
     def _on_sentence_begin(self, message, *args):
         try:
             data = json.loads(message) if isinstance(message, str) else {}
-            speaker = data.get("payload", {}).get("speaker_id")
+            payload = data.get("payload", {})
+            speaker = payload.get("speaker_id")
+            speaker_name = (
+                payload.get("speaker_name")
+                or payload.get("identity")
+                or payload.get("role")
+            )
             if speaker is not None:
                 self.last_speaker_id = str(speaker)
+            if speaker_name:
+                self.last_speaker_name = str(speaker_name)
             print(
-                f"[ASR-Tingwu] SentenceBegin: index={data.get('payload', {}).get('index')} speaker={speaker}"
+                f"[ASR-Tingwu] SentenceBegin: index={payload.get('index')} speaker={speaker} name={speaker_name}"
             )
         except Exception:
             pass
@@ -432,8 +454,20 @@ class TingwuProvider(ASRProvider):
             payload = data.get("payload", {})
             text = payload.get("result", "")
             speaker = payload.get("speaker_id")
+            speaker_name = (
+                payload.get("speaker_name")
+                or payload.get("identity")
+                or payload.get("role")
+            )
             if speaker is not None:
                 self.last_speaker_id = str(speaker)
+            if speaker_name:
+                self.last_speaker_name = str(speaker_name)
+
+            if text:
+                print(
+                    f"[ASR-Tingwu] ResultChanged: {text} (speaker={speaker}, name={speaker_name})"
+                )
             if text and self.on_text_update and self.loop:
                 asyncio.run_coroutine_threadsafe(
                     self.on_text_update(text, False), self.loop
@@ -448,8 +482,16 @@ class TingwuProvider(ASRProvider):
             payload = data.get("payload", {})
             text = payload.get("result", "")
             speaker = payload.get("speaker_id")
+            speaker_name = (
+                payload.get("speaker_name")
+                or payload.get("identity")
+                or payload.get("role")
+            )
+
             if speaker is not None:
                 self.last_speaker_id = str(speaker)
+            if speaker_name:
+                self.last_speaker_name = str(speaker_name)
 
             # 拼接 stash_result（暂存的下一句开头）
             stash = payload.get("stash_result", {})
@@ -460,8 +502,9 @@ class TingwuProvider(ASRProvider):
                 full_text = text + stash_text
 
             print(
-                f"[ASR-Tingwu] SentenceEnd: speaker={speaker} text={text} stash={stash_text}"
+                f"[ASR-Tingwu] SentenceEnd: speaker={speaker} name={speaker_name} text={text} stash={stash_text}"
             )
+            print(f"DEBUG: Tingwu Final Text: {full_text}")
 
             if full_text and self.on_text_update and self.loop:
                 asyncio.run_coroutine_threadsafe(
@@ -482,24 +525,73 @@ class TingwuProvider(ASRProvider):
     # ── 主推流线程 ──
 
     def _run_nls(self):
-        """在独立线程中运行 NLS 推流"""
-        try:
-            import nls
+        """在独立线程中运行 WebSocket 推流"""
 
-            self._rm = nls.NlsRealtimeMeeting(
-                url=self._meeting_url,
-                on_sentence_begin=self._on_sentence_begin,
-                on_sentence_end=self._on_sentence_end,
-                on_start=self._on_start,
-                on_result_changed=self._on_result_changed,
-                on_completed=self._on_completed,
-                on_error=self._on_error,
-                on_close=self._on_close,
-            )
-            self._rm.start()
-        except Exception as e:
-            print(f"[ASR-Tingwu] NLS 启动异常: {e}")
-            self._ready_event.set()  # 解除等待
+        async def _async_run():
+            import websockets
+
+            try:
+                # 听悟官方最新协议：连接建立后，需立即发送 StartTranscription 指令开始推流
+                async with websockets.connect(self._meeting_url) as ws:
+                    self._ws = ws
+
+                    # 握手指令
+                    start_msg_id = uuid.uuid4().hex
+                    start_cmd = {
+                        "header": {
+                            "message_id": start_msg_id,
+                            "task_id": self._task_id,
+                            "namespace": "SpeechTranscriber",
+                            "name": "StartTranscription",
+                            "appkey": self._app_key,
+                        },
+                        "payload": {
+                            "format": "pcm",
+                            "sample_rate": 16000,
+                            "enable_intermediate_result": True,
+                        },
+                    }
+                    await ws.send(json.dumps(start_cmd))
+
+                    self._ready_event.set()
+
+                    # 循环接收云端回传事件
+                    async for message in ws:
+                        if not self.is_started:
+                            break
+                        try:
+                            data = json.loads(message)
+                            header = data.get("header", {})
+                            name = header.get("name")
+
+                            if name == "TranscriptionStarted":
+                                self._on_start(message)
+                            elif name == "SentenceBegin":
+                                self._on_sentence_begin(message)
+                            elif name == "TranscriptionResultChanged":
+                                self._on_result_changed(message)
+                            elif name == "SentenceEnd":
+                                self._on_sentence_end(message)
+                            elif name == "TaskFailed":
+                                self._on_error(message)
+                            elif name == "TranscriptionCompleted":
+                                self._on_completed(message)
+                                break
+                        except Exception as e:
+                            print(f"[ASR-Tingwu] 解析回调异常: {e}")
+            except Exception as e:
+                print(f"[ASR-Tingwu] WebSocket 连接断开/异常: {e}")
+                self._ready_event.set()
+
+        # 由于外层是一个普通的 Thread，我们需要起一个事件循环
+        new_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(new_loop)
+        self._ws_loop = new_loop
+        try:
+            new_loop.run_until_complete(_async_run())
+        finally:
+            self._ws_loop = None
+            new_loop.close()
 
     # ── ASRProvider 接口实现 ──
 
@@ -528,23 +620,39 @@ class TingwuProvider(ASRProvider):
         print(f"[ASR] 通义听悟提供商已启动 (说话人分离={self._speaker_count}人)")
 
     def add_audio(self, chunk: bytes):
-        if self.is_started and self._rm:
+        if self.is_started and hasattr(self, "_ws") and self._ws:
             try:
-                self._rm.send_audio(chunk)
+                # 必须将任务丢给自己所在的 WS 专门专用的 Event Loop (新建的 new_loop)
+                loop = getattr(self, "_ws_loop", None)
+                if not loop:
+                    return
+                # 包装发送音频（要按照阿里的 OP_BINARY 标准发送纯二进制即可，因为 Start 已经声明格式为 pcm）
+
+                future = asyncio.run_coroutine_threadsafe(self._ws.send(chunk), loop)
+
+                def _on_done(f):
+                    try:
+                        f.result()
+                    except Exception as e:
+                        print(f"[ASR-Tingwu] 跨线程发送 WS 音频失败: {e}")
+
+                future.add_done_callback(_on_done)
             except Exception as e:
-                print(f"[ASR-Tingwu] 发送音频失败: {e}")
+                print(f"[ASR-Tingwu] 发送音频排队失败: {e}")
 
     def stop(self):
         if not self.is_started:
             return
         self.is_started = False
 
-        # 1. 停止 NLS 推流
-        if self._rm:
+        # 1. 停止 WebSocket 推流
+        if hasattr(self, "_ws") and self._ws:
             try:
-                self._rm.stop()
+                loop = getattr(self, "_ws_loop", None)
+                if loop and not loop.is_closed():
+                    asyncio.run_coroutine_threadsafe(self._ws.close(), loop)
             except Exception as e:
-                print(f"[ASR-Tingwu] NLS stop 异常: {e}")
+                print(f"[ASR-Tingwu] WebSocket close 异常: {e}")
 
         # 2. REST 结束任务
         self._stop_realtime_task()
@@ -555,6 +663,7 @@ class TingwuProvider(ASRProvider):
 
 # ── 工厂实例化 ──
 def get_asr_processor() -> ASRProvider:
+    print(f"[ASR] 使用 {PROVIDER} ASR 提供商")
     if PROVIDER == "tingwu":
         return TingwuProvider()
     return DoubaoProvider()

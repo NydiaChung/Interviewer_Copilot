@@ -2,6 +2,9 @@ import os
 import pytest
 import io
 import json
+import base64
+import asyncio
+import inspect
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
@@ -104,6 +107,38 @@ class _FakeASR:
 
     def stop(self):
         return
+
+
+class _RecordingASR(_FakeASR):
+    def __init__(self):
+        super().__init__()
+        self.audio_chunks = []
+
+    def add_audio(self, chunk: bytes):
+        self.audio_chunks.append(chunk)
+
+
+class _TriggeringASR(_RecordingASR):
+    def __init__(self, trigger_text: str = ""):
+        super().__init__()
+        self.trigger_text = trigger_text
+        self.callback_is_async = False
+
+    def set_callback(self, callback, loop):
+        super().set_callback(callback, loop)
+        self.callback_is_async = inspect.iscoroutinefunction(callback)
+
+    def add_audio(self, chunk: bytes):
+        super().add_audio(chunk)
+        if self.trigger_text and self.callback and self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self.callback(self.trigger_text, False), self.loop
+            )
+
+
+class _FailStartASR(_FakeASR):
+    def start(self):
+        raise RuntimeError("asr start failed")
 
 
 class _FakeLLM:
@@ -221,3 +256,87 @@ def test_end_session_returns_fallback_when_analysis_fails():
             response = ws.receive_json()
             assert response["type"] == "analysis"
             assert "复盘生成超时或失败" in response["answer"]
+
+
+def test_dual_stream_text_audio_frame_is_forwarded_to_asr():
+    """双流模式下桌面端会发送 text(JSON+base64) 音频帧，后端也应转发给 ASR。"""
+    from server import main
+
+    fake_asr = _RecordingASR()
+    fake_llm = _FakeLLM()
+    raw = b"\x01\x02\x03\x04\x05\x06\x07\x08"
+    audio_payload = {
+        "type": "audio",
+        "channel": "system",
+        "data": base64.b64encode(raw).decode("ascii"),
+    }
+
+    with patch.object(main, "llm_processor", fake_llm), patch.object(
+        main, "get_asr_processor", return_value=fake_asr
+    ):
+        with client.websocket_connect("/ws/audio") as ws:
+            ws.send_text(json.dumps(audio_payload))
+            ws.send_text(json.dumps({"command": "end_session"}))
+            response = ws.receive_json()
+            assert response["type"] == "analysis"
+
+    assert fake_asr.audio_chunks, "text audio payload was not forwarded to ASR"
+    assert fake_asr.audio_chunks[0] == raw
+
+
+def test_candidate_channel_callback_is_async_and_emits_incremental():
+    from server import main
+
+    main_asr = _RecordingASR()
+    candidate_asr = _TriggeringASR(trigger_text="候选人：您好，我先做个自我介绍。")
+    fake_llm = _FakeLLM()
+    raw = b"\x10\x20\x30\x40\x50\x60\x70\x80"
+    audio_payload = {
+        "type": "audio",
+        "channel": "mic",
+        "data": base64.b64encode(raw).decode("ascii"),
+    }
+    providers = [main_asr, candidate_asr]
+
+    def _factory():
+        return providers.pop(0)
+
+    with patch.object(main, "llm_processor", fake_llm), patch.object(
+        main, "get_asr_processor", side_effect=_factory
+    ):
+        with client.websocket_connect("/ws/audio") as ws:
+            ws.send_text(json.dumps(audio_payload))
+            incremental = ws.receive_json()
+            assert incremental["type"] == "incremental"
+            assert incremental["speaker_role"] == "candidate"
+            assert "自我介绍" in incremental["text"]
+
+            ws.send_text(json.dumps({"command": "end_session"}))
+            analysis = ws.receive_json()
+            assert analysis["type"] == "analysis"
+
+    assert candidate_asr.audio_chunks, "candidate audio was not forwarded"
+    assert candidate_asr.audio_chunks[0] == raw
+    assert (
+        candidate_asr.callback_is_async
+    ), "candidate ASR callback must be async coroutine"
+
+
+def test_websocket_keeps_alive_when_asr_start_fails():
+    from server import main
+
+    fake_llm = _FakeLLM()
+    with patch.object(main, "llm_processor", fake_llm), patch.object(
+        main, "get_asr_processor", return_value=_FailStartASR()
+    ):
+        with client.websocket_connect("/ws/audio") as ws:
+            warning = ws.receive_json()
+            assert warning["type"] == "incremental"
+            assert "语音识别暂不可用" in warning["text"]
+
+            ws.send_text(json.dumps({"command": "manual_question", "text": "你好"}))
+            incremental = ws.receive_json()
+            assert incremental["type"] == "incremental"
+            answer = ws.receive_json()
+            assert answer["type"] == "answer"
+            assert answer["answer"] == "answer:你好"

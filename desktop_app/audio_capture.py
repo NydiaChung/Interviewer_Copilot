@@ -21,7 +21,8 @@ SOURCE_DOMINANCE_RATIO = 1.25
 try:
     import pyaudio
 
-    FORMAT = pyaudio.paFloat32
+    # ASR 服务端期望 16k/16bit PCM，采集端统一使用 paInt16，避免格式不匹配导致识别失败。
+    FORMAT = pyaudio.paInt16
     PYAUDIO_OK = True
 except Exception as e:
     print(f"[Audio] PyAudio 不可用: {e}")
@@ -131,6 +132,10 @@ class AudioCapture:
         self.bh_chunk = max(CHUNK_16K, int(CHUNK_16K * self.bh_rate / RATE_MIC))
         self.mic_stream = None
         self.sys_stream = None
+        self._sys_active_seen = False
+        self._sys_silent_windows = 0
+        # 双流降级：如果检测不到系统音频（或根本没有系统采集设备），回退到 mic->main
+        self._fallback_to_mic_main = bool(dual_stream_mode and self.system_index is None)
 
     """
     音频源活动状态检测:
@@ -216,13 +221,26 @@ class AudioCapture:
             except Exception as e:
                 print(f"[Audio] BlackHole 流失败: {e}")
                 self.sys_stream = None
+        elif self.dual_stream_mode:
+            print("[Audio] 未检测到系统音频设备，双流降级为 mic->main")
 
     # 系统音频格式标准化处理：多声道 + 任意采样率 → 16kHz 单声道（精确重采样）
     def _sys_to_16k_mono(self, raw: bytes) -> bytes:
         ch = self.bh_channels
         # 1. 多声道 → 单声道（各声道平均）
-        data = np.frombuffer(raw, dtype=np.float32).reshape(-1, ch)
-        mono = data.mean(axis=1).astype(np.float32).tobytes()
+        data = np.frombuffer(raw, dtype=np.int16)
+        if ch > 1:
+            frames = len(data) // ch
+            if frames <= 0:
+                return b""
+            data = data[: frames * ch].reshape(-1, ch)
+            mono = (
+                np.clip(np.rint(data.astype(np.float32).mean(axis=1)), -32768, 32767)
+                .astype(np.int16)
+                .tobytes()
+            )
+        else:
+            mono = data.tobytes()
         # 2. 任意采样率 → 16kHz（audioop.ratecv 保持连续状态，不引入断续噪声）
         mono_16k, self._ratecv_state = audioop.ratecv(
             mono, 2, 1, self.bh_rate, RATE_MIC, self._ratecv_state
@@ -230,7 +248,7 @@ class AudioCapture:
         return mono_16k
 
     def _send_audio(self):
-        N = CHUNK_16K * 2  # 字节数（float32 = 2 bytes/sample）
+        N = CHUNK_16K * 2  # 字节数（int16 = 2 bytes/sample）
         has_mic = self.mic_stream is not None
         has_sys = self.sys_stream is not None
 
@@ -261,15 +279,36 @@ class AudioCapture:
                 sys_chunk = self.sys_buffer[:N]
                 self.sys_buffer = self.sys_buffer[N:]
 
+                _, mic_rms, sys_rms = self._detect_source_activity(mic_chunk, sys_chunk)
+                if sys_rms >= SOURCE_ACTIVE_RMS:
+                    self._sys_active_seen = True
+                    self._sys_silent_windows = 0
+                    if self._fallback_to_mic_main:
+                        self._fallback_to_mic_main = False
+                        print("[Audio] 系统音频已恢复，恢复双流路由")
+                elif mic_rms >= SOURCE_ACTIVE_RMS:
+                    self._sys_silent_windows += 1
+                    if (
+                        self.dual_stream_mode
+                        and not self._sys_active_seen
+                        and not self._fallback_to_mic_main
+                        and self._sys_silent_windows >= 25
+                    ):
+                        self._fallback_to_mic_main = True
+                        print("[Audio] 持续未检测到系统音频，降级为 mic->main")
+
                 if self.dual_stream_mode:
-                    # 分流模式，单独派发
-                    self.callback(sys_chunk, channel="system")
-                    self.callback(mic_chunk, channel="mic")
+                    # 分流模式：正常 system->main, mic->candidate；降级时 mic->main 保底字幕
+                    if self._fallback_to_mic_main:
+                        self.callback(mic_chunk, channel="system")
+                    else:
+                        self.callback(sys_chunk, channel="system")
+                        self.callback(mic_chunk, channel="mic")
                 else:
-                    # 强混流模式
-                    mic_np = np.frombuffer(mic_chunk, dtype=np.float32).astype(np.int32)
-                    sys_np = np.frombuffer(sys_chunk, dtype=np.float32).astype(np.int32)
-                    mixed = np.clip(mic_np + sys_np, -32768, 32767).astype(np.float32)
+                    # 强混流模式 (PyAudio FORMAT=paInt16)
+                    mic_np = np.frombuffer(mic_chunk, dtype=np.int16).astype(np.int32)
+                    sys_np = np.frombuffer(sys_chunk, dtype=np.int16).astype(np.int32)
+                    mixed = np.clip(mic_np + sys_np, -32768, 32767).astype(np.int16)
                     self.callback(mixed.tobytes())
 
                 self._emit_source_meta(mic_chunk, sys_chunk)
@@ -280,7 +319,10 @@ class AudioCapture:
                 chunk = self.mic_buffer[:N]
                 self.mic_buffer = self.mic_buffer[N:]
                 if self.dual_stream_mode:
-                    self.callback(chunk, channel="mic")
+                    self.callback(
+                        chunk,
+                        channel="system" if self._fallback_to_mic_main else "mic",
+                    )
                 else:
                     self.callback(chunk)
                 self._emit_source_meta(chunk, None)

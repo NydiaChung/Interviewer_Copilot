@@ -6,9 +6,15 @@ import websockets
 import json
 import time
 import base64
+from pathlib import Path
+from dotenv import load_dotenv
 from PyQt6.QtWidgets import QApplication
 from overlay_ui import OverlayUI
 from control_panel import ControlPanelUI
+
+# Load .env file from project root
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 try:
     from audio_capture import AudioCapture
@@ -21,7 +27,7 @@ except Exception as e:
 
 # Use the local backend url
 WS_URL = os.getenv("WS_URL", "ws://localhost:8000/ws/audio")
-DUAL_STREAM_MODE = os.getenv("DUAL_STREAM_MODE", "true").lower()
+DUAL_STREAM_MODE = os.getenv("DUAL_STREAM_MODE", "true").lower() == "true"
 
 
 class DesktopApp:
@@ -212,7 +218,13 @@ class DesktopApp:
                     try:
                         while True:  # 循环监听后端消息
                             message = await websocket.recv()  # 异步接收消息（不阻塞）
-                            data = json.loads(message)  # 解析 JSON 消息
+                            try:
+                                data = json.loads(message)  # 解析 JSON 消息
+                            except Exception as e:
+                                print(
+                                    f"[Desktop] 忽略无法解析的后端消息: {str(e)}; raw={str(message)[:120]}"
+                                )
+                                continue
                             msg_type = data.get(
                                 "type", "answer"
                             )  # 消息类型（answer/outline/analysis）
@@ -249,6 +261,9 @@ class DesktopApp:
                     except websockets.exceptions.ConnectionClosed:
                         # 连接关闭时的处理：打印日志，通知控制面板
                         print("[Desktop] 后端连接关闭.")
+                        self.control_panel.interview_ended_signal.emit()
+                    except Exception as e:
+                        print(f"[Desktop] 接收后端消息异常: {e}")
                         self.control_panel.interview_ended_signal.emit()
 
                 # 创建并启动接收任务（异步任务，不阻塞主线程），和下面发数据同时进行
