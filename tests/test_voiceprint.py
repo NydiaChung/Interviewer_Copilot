@@ -47,3 +47,65 @@ def test_voiceprint_ignores_silence_and_bad_frames():
     assert tracker.update_audio(b"\x00" * 640, ts=0.1) is None
     assert tracker.update_audio(b"\x00" * 641, ts=0.2) is None
     assert tracker.dominant_speaker(ts=0.3) is None
+
+
+def test_voiceprint_max_speakers_fallback(mocker):
+    tracker = VoiceprintTracker(assign_threshold=0.1, max_speakers=2)
+
+    mocker.patch.object(
+        VoiceprintTracker,
+        "_extract_features",
+        side_effect=[
+            (0.1, 0.1, 0.1, 0.1),
+            (0.9, 0.9, 0.9, 0.9),
+            (0.15, 0.15, 0.15, 0.15),
+        ],
+    )
+
+    sid1 = tracker.update_audio(b"A" * 640, ts=0.1)
+    sid2 = tracker.update_audio(b"B" * 640, ts=0.2)
+    sid3 = tracker.update_audio(b"C" * 640, ts=0.3)
+
+    assert sid1 is not None and sid2 is not None and sid3 is not None
+    assert sid1 != sid2
+    assert sid3 == sid1
+
+
+def test_voiceprint_short_chunk_returns_none():
+    tracker = VoiceprintTracker()
+    assert tracker.update_audio(b"short", ts=0.1) is None
+
+
+def test_voiceprint_low_rms_returns_none():
+    tracker = VoiceprintTracker(min_rms=20000)
+    chunk = _tone(200, 15)
+    sid = tracker.update_audio(chunk, ts=0.1)
+    assert sid is None
+
+
+def test_voiceprint_cleanup_old_events():
+    tracker = VoiceprintTracker(lookback_seconds=1.0)
+    chunk = _tone(200, 5000)
+    tracker.update_audio(chunk, ts=0.1)
+    tracker.update_audio(chunk, ts=3.1)
+
+    assert len(tracker._events) == 1
+    assert tracker._events[0][0] == 3.1
+
+
+def test_voiceprint_dominant_speaker_age_filters():
+    tracker = VoiceprintTracker(lookback_seconds=1.0)
+    chunk = _tone(200, 5000)
+    sid = tracker.update_audio(chunk, ts=1.0)
+
+    assert tracker.dominant_speaker(ts=0.5) is None
+    assert tracker.dominant_speaker(ts=2.5) is None
+
+
+def test_voiceprint_audioop_error_mock(mocker):
+    tracker = VoiceprintTracker()
+    mocker.patch.object(
+        VoiceprintTracker, "_extract_features", return_value=(0.5, 0.5, 0.5, 0.5)
+    )
+    sid = tracker.update_audio(b"123", ts=0.1)
+    assert sid is None

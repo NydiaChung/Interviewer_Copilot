@@ -50,7 +50,7 @@ class ControlPanelUI(QWidget):
             QWidget {
                 background-color: #343541;
                 color: #ECECF1;
-                font-family: 'Inter', 'Segoe UI', Arial;
+                font-family: -apple-system, 'SF Pro Text', 'Segoe UI', Arial;
             }
             #sidebar {
                 background-color: #202123;

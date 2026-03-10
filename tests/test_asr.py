@@ -156,3 +156,240 @@ async def test_doubao_receiver_error_handling():
     # 只要不抛出未捕获异常即视为成功
     await provider._receiver(mock_ws)
     assert len(provider._recv_buffer) == 0
+
+
+# --------------- Supplementary ASR Coverage ---------------
+
+
+def test_asr_provider_base():
+    from server.asr import ASRProvider
+
+    class Concrete(ASRProvider):
+        def start(self):
+            super().start()
+
+        def add_audio(self, c):
+            super().add_audio(c)
+
+        def stop(self):
+            super().stop()
+
+    p = Concrete()
+    p.set_callback(lambda x, y: None, None)
+    assert p.on_text_update is not None
+
+    # abstract methods don't do anything but we call them for coverage
+    p.start()
+    p.add_audio(b"")
+    p.stop()
+
+
+def test_doubao_start_missing_keys(mocker):
+    mocker.patch("server.asr.DOUBAO_APP_ID", "")
+    p = DoubaoProvider()
+    with pytest.raises(ValueError, match="DOUBAO"):
+        p.start()
+
+
+def test_doubao_start_timeout(mocker):
+    mocker.patch("server.asr.DOUBAO_APP_ID", "test")
+    mocker.patch("server.asr.DOUBAO_ACCESS_TOKEN", "test")
+    p = DoubaoProvider()
+    # mock event wait to always timeout
+    mocker.patch.object(p._ready_event, "wait", return_value=False)
+    with pytest.raises(RuntimeError, match="内部队列未就绪"):
+        p.start()
+
+
+def test_doubao_start_success_and_stop(mocker):
+    mocker.patch("server.asr.DOUBAO_APP_ID", "test")
+    mocker.patch("server.asr.DOUBAO_ACCESS_TOKEN", "test")
+    p = DoubaoProvider()
+
+    # Mock thread start to just immediately set ready event so it doesn't hang
+    def fake_start():
+        p._ready_event.set()
+        p._ws_loop = MagicMock()
+        p._audio_queue = MagicMock()
+
+    mocker.patch("threading.Thread.start", side_effect=fake_start)
+    p.start()
+    assert p.is_started is True
+
+    # Already started
+    p.start()
+
+    # Add audio
+    p.add_audio(b"123")
+
+    # Stop
+    p.stop()
+    assert p.is_started is False
+    p.stop()  # call again
+
+
+@pytest.mark.asyncio
+async def test_doubao_sender_loop(mocker):
+    p = DoubaoProvider()
+    p.is_started = True
+    p._audio_count = 0
+    p._audio_queue = asyncio.Queue()
+
+    await p._audio_queue.put(b"chunk1")
+    await p._audio_queue.put(b"chunk2")
+    await p._audio_queue.put(None)  # stop signal
+
+    mock_ws = AsyncMock()
+    await p._sender(mock_ws)
+    assert mock_ws.send.call_count == 3
+
+    # test sender timeout and exception
+    p.is_started = True
+    p._audio_queue = (
+        asyncio.Queue()
+    )  # empty queue will timeout eventually, but wait_for is mocked
+    mocker.patch("asyncio.wait_for", side_effect=asyncio.TimeoutError)
+
+    mock_ws.send.side_effect = Exception("err")
+    await p._sender(mock_ws)
+
+
+@pytest.mark.asyncio
+async def test_doubao_ws_client_error(mocker):
+    p = DoubaoProvider()
+    mocker.patch("websockets.connect", side_effect=Exception("conn err"))
+    await p._ws_client()
+
+
+def test_doubao_run_wrapper(mocker):
+    p = DoubaoProvider()
+    mocker.patch.object(p, "_ws_client", side_effect=Exception("run err"))
+    p._run()
+
+
+from server.asr import TingwuProvider
+
+
+def test_tingwu_start_missing_keys(mocker):
+    mocker.patch("server.asr.ALIYUN_AK_ID", "")
+    p = TingwuProvider()
+    with pytest.raises(ValueError):
+        p.start()
+
+
+def test_tingwu_start_missing_keys():
+    import os
+    from unittest.mock import patch
+
+    with patch.dict(os.environ, {}, clear=True):
+        p = TingwuProvider()
+        with pytest.raises(ValueError):
+            p.start()
+
+
+def test_tingwu_start_success_stop_add_audio(mocker):
+    import os
+    from unittest.mock import patch
+
+    with patch.dict(
+        os.environ,
+        {
+            "TINGWU_ACCESS_KEY_ID": "a",
+            "TINGWU_ACCESS_KEY_SECRET": "b",
+            "TINGWU_APP_KEY": "c",
+        },
+    ):
+        p = TingwuProvider()
+
+        mocker.patch.object(
+            p, "_create_realtime_task", return_value=("task_123", "wss://url")
+        )
+
+        # mock thread start
+        def fake_start():
+            p._ready_event.set()
+
+        mocker.patch("threading.Thread.start", side_effect=fake_start)
+
+        p.start()
+        assert p.is_started is True
+
+        # send audio
+        p.add_audio(b"pcm")
+
+        # stop
+        mocker.patch.object(p, "_stop_realtime_task")
+        p.stop()
+        assert p.is_started is False
+
+        # call stop again
+        p.stop()
+
+
+def test_tingwu_create_and_stop_task(mocker):
+    import os
+    from unittest.mock import patch
+
+    with patch.dict(
+        os.environ,
+        {
+            "TINGWU_ACCESS_KEY_ID": "a",
+            "TINGWU_ACCESS_KEY_SECRET": "b",
+            "TINGWU_APP_KEY": "c",
+        },
+    ):
+        p = TingwuProvider()
+
+        mock_client = MagicMock()
+        mock_client.do_action_with_exception.return_value = json.dumps(
+            {"Data": {"TaskId": "123", "MeetingJoinUrl": "ws"}}
+        ).encode()
+        mocker.patch("aliyunsdkcore.client.AcsClient", return_value=mock_client)
+
+        tid, url = p._create_realtime_task()
+        assert tid == "123"
+        assert url == "ws"
+
+        # test failure
+        mock_client.do_action_with_exception.return_value = json.dumps(
+            {"Data": {}}
+        ).encode()
+        with pytest.raises(RuntimeError):
+            p._create_realtime_task()
+
+        # test stop
+        p._task_id = "123"
+        mock_client.do_action_with_exception.return_value = b'{"success": true}'
+        p._stop_realtime_task()
+
+
+def test_tingwu_callbacks():
+    p = TingwuProvider()
+    p.on_text_update = MagicMock()
+    p.loop = asyncio.new_event_loop()
+
+    # start
+    p._on_start("msg")
+    assert p._ready_event.is_set()
+
+    # phrase begin
+    p._on_sentence_begin(
+        json.dumps({"payload": {"speaker_id": "spk1", "speaker_name": "Speaker1"}})
+    )
+    assert p.last_speaker_id == "spk1"
+    assert p.last_speaker_name == "Speaker1"
+
+    # result changed
+    p._on_result_changed(json.dumps({"payload": {"result": "txt"}}))
+
+    # sentence end
+    p._on_sentence_end(json.dumps({"payload": {"result": "txt"}}))
+
+    # completed
+    p._on_completed("msg")
+
+    # error
+    p._on_error("err")
+
+    # close
+    p._on_close()

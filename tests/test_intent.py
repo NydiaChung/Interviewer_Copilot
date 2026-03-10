@@ -53,3 +53,22 @@ def test_is_question_like_plain_statement_returns_false():
     assert is_question_like("我在阶段主要负责后端架构") is False
     assert is_question_like("项目于 2023 年上线") is False
     assert is_question_like("") is False
+
+
+def test_intent_should_trigger_outline_short_text():
+    detector = IntentReadinessDetector(min_chars=6)
+    # 刚好小于6个字符的纯文本
+    assert detector.should_trigger_outline("短文本", now=1.0) is False
+    assert detector._last_text == "短文本"
+
+    # 空文本
+    assert detector.should_trigger_outline("", now=2.0) is False
+    assert detector._last_text == ""
+
+
+def test_similarity_empty():
+    from server.intent import _similarity
+
+    assert _similarity("", "abc") == 0.0
+    assert _similarity("abc", "") == 0.0
+    assert _similarity(None, "abc") == 0.0

@@ -34,17 +34,60 @@ QA_CARD_BG = "rgba(255, 255, 255, 6)"
 FONT_FAMILY = "SF Pro Text"
 
 
-def _bubble_widget(role: str, text: str, highlighted: bool = False) -> QFrame:
-    """创建一个说话人气泡 Widget。"""
-    bubble = QFrame()
-    bubble.setObjectName("bubble")
+def _bubble_widget(
+    role: str,
+    text: str,
+    question_id: int | None,
+    truncate_callback,
+    highlighted: bool = False,
+) -> QWidget:
+    """创建一个包含说话人气泡和截断按钮的容器。"""
+    container = QWidget()
+    layout = QHBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(0)  # 间距设为0，通过内部组件控制位置
 
     is_interviewer = role == "interviewer"
-    prefix = "🔵 面试官" if is_interviewer else "🟢 我"
-    bg = INTERVIEWER_BUBBLE_BG if is_interviewer else CANDIDATE_BUBBLE_BG
-    align = "left" if is_interviewer else "right"
-    margin = "margin-right: 40px;" if is_interviewer else "margin-left: 40px;"
 
+    # 截断按钮及其固定容器
+    btn_container = QWidget()
+    btn_container.setFixedWidth(50)  # 固定宽度，确保按钮纵向对齐
+    btn_layout = QHBoxLayout(btn_container)
+    btn_layout.setContentsMargins(0, 0, 0, 0)
+    btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    truncate_btn = QPushButton("🔘")
+    truncate_btn.setFixedSize(30, 30)
+    truncate_btn.setFont(QFont(FONT_FAMILY, 10))
+    truncate_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+    truncate_btn.setStyleSheet(
+        """
+        QPushButton {
+            background: rgba(255, 255, 255, 10);
+            border: 1px solid rgba(255, 255, 255, 20);
+            border-radius: 4px;
+            color: rgba(255, 255, 255, 120);
+        }
+        QPushButton:hover {
+            background: rgba(244, 63, 94, 0.4);
+            color: white;
+            border-color: rgba(244, 63, 94, 0.6);
+        }
+    """
+    )
+    if question_id is not None:
+        truncate_btn.clicked.connect(
+            lambda checked=False, q=question_id: truncate_callback(q)
+        )
+    else:
+        truncate_btn.setEnabled(False)
+        truncate_btn.hide()
+    btn_layout.addWidget(truncate_btn)
+
+    # 实际的气泡卡片
+    bubble = QFrame()
+    bubble.setObjectName("bubble")
+    bg = INTERVIEWER_BUBBLE_BG if is_interviewer else CANDIDATE_BUBBLE_BG
     highlight_css = (
         f"border-left: 3px solid rgba(250, 204, 21, 0.7); background: {HIGHLIGHT_BG};"
         if highlighted
@@ -55,37 +98,46 @@ def _bubble_widget(role: str, text: str, highlighted: bool = False) -> QFrame:
         f"""
         QFrame#bubble {{
             background: {bg};
-            border-radius: 10px;
+            border-radius: 12px;
             padding: 8px 12px;
-            {margin}
             {highlight_css}
         }}
     """
     )
 
-    layout = QVBoxLayout(bubble)
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(2)
+    bubble_layout = QVBoxLayout(bubble)
+    bubble_layout.setContentsMargins(0, 0, 0, 0)
+    bubble_layout.setSpacing(2)
 
-    # 说话人标签
+    prefix = "🔵 面试官" if is_interviewer else "🟢 我"
     role_label = QLabel(prefix)
     role_label.setFont(QFont(FONT_FAMILY, 10, QFont.Weight.Bold))
     role_label.setStyleSheet(
         f"color: {'rgba(96, 165, 250, 0.9)' if is_interviewer else 'rgba(74, 222, 128, 0.9)'}; "
         "background: transparent;"
     )
-    layout.addWidget(role_label)
+    bubble_layout.addWidget(role_label)
 
-    # 文本内容
     text_label = QLabel(text)
     text_label.setFont(QFont(FONT_FAMILY, 13))
     text_label.setStyleSheet("color: rgba(255,255,255,200); background: transparent;")
     text_label.setWordWrap(True)
     text_label.setTextFormat(Qt.TextFormat.PlainText)
-    layout.addWidget(text_label)
+    bubble_layout.addWidget(text_label)
 
-    bubble.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
-    return bubble
+    if is_interviewer:
+        # 面试官：气泡居左，按钮固定在中间/右侧对齐
+        layout.addWidget(bubble)
+        layout.addStretch()
+        layout.addWidget(btn_container)
+    else:
+        # 候选人：按钮固定在中间/左侧对齐，气泡居右
+        layout.addWidget(btn_container)
+        layout.addStretch()
+        layout.addWidget(bubble)
+
+    container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+    return container
 
 
 def _qa_card_widget(question: str, answer: str, streaming: bool = False) -> QFrame:
@@ -128,9 +180,11 @@ def _qa_card_widget(question: str, answer: str, streaming: bool = False) -> QFra
 class OverlayUI(QWidget):
     # 信号定义
     update_signal = pyqtSignal(str, str)  # (msg_type, json_payload)
-    end_session_signal = pyqtSignal()
+    end_session_signal = pyqtSignal()  # 结束并复盘信号 (Option+E)
+    close_window_signal = pyqtSignal()  # 仅关闭窗口信号 (❌, Cmd+\)
     send_text_signal = pyqtSignal(str)
-    highlight_signal = pyqtSignal(int)  # question_id to highlight
+    truncate_signal = pyqtSignal(int)  # 手动截断信号 (question_id)
+    highlight_signal = pyqtSignal(int)  # 高亮信号 (question_id)
 
     def __init__(self):
         super().__init__()
@@ -143,6 +197,10 @@ class OverlayUI(QWidget):
             None  # 当前正在更新的气泡对应的 question_id
         )
         self._current_bubble_role: str = "unknown"
+        self._current_bubble_text_base: str = (
+            ""  # 当前气泡中已固定的文本前缀（用于多轮合并）
+        )
+        self._is_input_full: bool = False
         self.init_ui()
 
     def init_ui(self):
@@ -182,7 +240,10 @@ class OverlayUI(QWidget):
         self.title_label = QLabel("🎙️ 面试助手")
         self.title_label.setFont(QFont(FONT_FAMILY, 14, QFont.Weight.Bold))
         self.title_label.setStyleSheet("color: #FFFFFF; background: transparent;")
+        # 确保标题位置固定
+        self.title_label.setFixedWidth(120)
         title_row.addWidget(self.title_label)
+
         title_row.addStretch()
 
         self.status_label = QLabel("正在倾听...")
@@ -191,6 +252,31 @@ class OverlayUI(QWidget):
             "color: rgba(255,255,255,60); background: transparent;"
         )
         title_row.addWidget(self.status_label)
+
+        # 增加间距
+        title_row.addSpacing(12)
+
+        # 增加关闭按钮
+        self.btn_close = QPushButton("❌")
+        self.btn_close.setFixedSize(34, 34)
+        self.btn_close.setFont(QFont(FONT_FAMILY, 12))
+        self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_close.setStyleSheet(
+            """
+            QPushButton {
+                background: rgba(255, 255, 255, 12);
+                border: 1px solid rgba(255, 255, 255, 20);
+                border-radius: 4px;
+                color: rgba(255, 255, 255, 180);
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 20);
+                color: #FFFFFF;
+            }
+        """
+        )
+        self.btn_close.clicked.connect(self.close_window_signal.emit)
+        title_row.addWidget(self.btn_close)
         card_layout.addLayout(title_row)
 
         # ── 分割线 ──
@@ -202,8 +288,8 @@ class OverlayUI(QWidget):
         card_layout.addWidget(sep)
 
         # ── 双栏主体 ──
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setStyleSheet(
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setStyleSheet(
             "QSplitter::handle { background: rgba(255,255,255,8); width: 2px; }"
         )
 
@@ -257,10 +343,11 @@ class OverlayUI(QWidget):
         self.answer_scroll.setWidget(self.answer_container)
         right_layout.addWidget(self.answer_scroll)
 
-        splitter.addWidget(left_frame)
-        splitter.addWidget(right_frame)
-        splitter.setSizes([540, 360])
-        card_layout.addWidget(splitter)
+        self.splitter.addWidget(left_frame)
+        self.splitter.addWidget(right_frame)
+        self.splitter.setSizes([540, 360])
+        # 将中间主体添加进布局，并设置伸缩因子为 1，确保其占据所有剩余空间
+        card_layout.addWidget(self.splitter, 1)
 
         # ── 分隔线 ──
         sep2 = QFrame()
@@ -308,8 +395,16 @@ class OverlayUI(QWidget):
         self.btn_send.clicked.connect(self.send_text)
         col.addWidget(self.btn_send)
 
+        self.btn_full = QPushButton("🔲")
+        self.btn_full.setFixedSize(34, 34)
+        self.btn_full.setToolTip("全屏/常规切换")
+        self.btn_full.setStyleSheet(self._btn_css())
+        self.btn_full.clicked.connect(self._toggle_input_expand)
+        col.addWidget(self.btn_full)
+
         row.addLayout(col)
-        card_layout.addLayout(row)
+        # 输入行设置伸缩因子为 0，确保其不随界面拉伸而变高
+        card_layout.addLayout(row, 0)
 
         # ── 底部提示 ──
         hint = QLabel("Option+E 结束并复盘")
@@ -332,7 +427,13 @@ class OverlayUI(QWidget):
         QShortcut(QKeySequence("Meta+E"), self).activated.connect(
             self.end_session_signal.emit
         )
-        QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self.send_text)
+        # Cmd+\ 快捷键 -> 仅关闭窗口
+        QShortcut(QKeySequence("Ctrl+\\"), self).activated.connect(
+            self.close_window_signal.emit
+        )
+        QShortcut(QKeySequence("Meta+\\"), self).activated.connect(
+            self.close_window_signal.emit
+        )
 
         # ── 信号连接 ──
         self.update_signal.connect(self._on_update)
@@ -379,23 +480,26 @@ class OverlayUI(QWidget):
 
         self.status_label.setText("正在倾听...")
 
-        # 同一 question_id + 同一角色：更新最后一个气泡
-        if (
-            question_id is not None
-            and question_id == self._current_bubble_qid
-            and display_role == self._current_bubble_role
-            and self._bubbles
-        ):
+        # 逻辑：如果角色没变且已有气泡，则尝试在当前气泡中更新或追加内容
+        if display_role == self._current_bubble_role and self._bubbles:
             last = self._bubbles[-1]
-            # 更新文本
-            text_label = last["widget"].findChildren(QLabel)[
-                -1
-            ]  # 最后一个 QLabel 是文本
-            text_label.setText(text)
-            last["text"] = text
+            text_label = last["widget"].findChildren(QLabel)[-1]
+
+            # 如果 question_id 变了（开启了新轮次），需要把上一轮的最终结果固定到 base 中
+            if question_id != self._current_bubble_qid and question_id is not None:
+                # 将上一轮的内容存入 base（加上空格分隔）
+                self._current_bubble_text_base = last["text"].strip() + " "
+                self._current_bubble_qid = question_id
+
+            # 拼接显示文本：已固定的内容 + 当前正在演变的文本
+            full_text = self._current_bubble_text_base + text
+            text_label.setText(full_text)
+            last["text"] = full_text
         else:
-            # 新建气泡
-            bubble = _bubble_widget(display_role, text)
+            # 角色变化或首次启动：创建新气泡
+            bubble = _bubble_widget(
+                display_role, text, question_id, self.truncate_signal.emit
+            )
             self._bubbles.append(
                 {
                     "role": display_role,
@@ -408,8 +512,11 @@ class OverlayUI(QWidget):
             # 插入到 stretch 之前
             idx = self.subtitle_layout.count() - 1
             self.subtitle_layout.insertWidget(idx, bubble)
+
+            # 更新追踪状态
             self._current_bubble_qid = question_id
             self._current_bubble_role = display_role
+            self._current_bubble_text_base = ""  # 新气泡，重置 base
 
         # 自动滚动到底部
         QTimer.singleShot(
@@ -537,8 +644,10 @@ class OverlayUI(QWidget):
         if text:
             self.send_text_signal.emit(text)
             self.text_input.clear()
-            # 在字幕区添加候选人气泡
-            bubble = _bubble_widget("candidate", f"📨 {text}")
+            # 在字幕区添加候选人气泡 (手动输入的问题，QID 可以设为特殊的，或者 None)
+            bubble = _bubble_widget(
+                "candidate", f"📨 {text}", None, self.truncate_signal.emit
+            )
             idx = self.subtitle_layout.count() - 1
             self.subtitle_layout.insertWidget(idx, bubble)
 
@@ -572,6 +681,18 @@ class OverlayUI(QWidget):
         if event.buttons() == Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self.drag_position)
             event.accept()
+
+    def _toggle_input_expand(self):
+        """切换输入框全屏模式。"""
+        self._is_input_full = not self._is_input_full
+        if self._is_input_full:
+            self.btn_full.setText("↙️")
+            self.splitter.hide()  # 隐藏中间的主体
+            self.text_input.setMaximumHeight(2000)  # 允许填充纵向
+        else:
+            self.btn_full.setText("🔲")
+            self.splitter.show()
+            self.text_input.setMaximumHeight(60)
 
     @staticmethod
     def _btn_css(primary=False):

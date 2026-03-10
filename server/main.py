@@ -88,6 +88,9 @@ CANDIDATE_ASR_RETRY_SECONDS = float(os.getenv("CANDIDATE_ASR_RETRY_SECONDS", "6.
 # 音源角色判定（desktop_app 上报）：system≈面试官，mic≈应聘者
 SOURCE_ACTIVITY_FRESH_SECONDS = 1.2
 SOURCE_TAKEOVER_CLOSE_WINDOW_SECONDS = 1.8
+USE_AUDIO_SOURCE_FOR_ROLE_SEPARATION = (
+    True  # 是否使用本地物理音源（System/Mic）强制区分说话人角色
+)
 
 
 def _normalize_text(text: str) -> str:
@@ -593,7 +596,9 @@ async def audio_websocket(websocket: WebSocket):
             }
         )
 
-    def _schedule_answer(question_text: str, source: str, question_id=None):
+    def _schedule_answer(
+        question_text: str, source: str, question_id=None, is_draft: bool = False
+    ):
         nonlocal next_answer_seq
         answer_seq = next_answer_seq
         next_answer_seq += 1
@@ -603,10 +608,15 @@ async def audio_websocket(websocket: WebSocket):
             source=source,
             question_id=question_id,
             question_preview=(question_text or "")[:80],
+            is_draft=is_draft,
         )
 
         async def _do_answer(
-            seq: int, question_snapshot: str, source_snapshot: str, qid
+            seq: int,
+            question_snapshot: str,
+            source_snapshot: str,
+            qid,
+            draft_flag: bool,
         ):
             nonlocal session_transcript
             try:
@@ -615,6 +625,7 @@ async def audio_websocket(websocket: WebSocket):
                     seq=seq,
                     source=source_snapshot,
                     question_id=qid,
+                    is_draft=draft_flag,
                 )
                 async with answer_generation_lock:
                     answer = await _call_with_timeout(
@@ -624,31 +635,37 @@ async def audio_websocket(websocket: WebSocket):
                         timeout_seconds=LLM_ANSWER_TIMEOUT_SECONDS,
                         fallback_text=ANSWER_FALLBACK_TEXT,
                     )
-                print(f"[LLM] Answer(seq={seq}): {answer}")
+
+                display_answer = f"【草稿正在生成】{answer}" if draft_flag else answer
+                print(f"[LLM] Answer(seq={seq}, draft={draft_flag}): {display_answer}")
                 _trace(
                     "answer_generation_done",
                     seq=seq,
                     source=source_snapshot,
                     question_id=qid,
-                    answer_len=len(answer or ""),
+                    answer_len=len(display_answer or ""),
+                    is_draft=draft_flag,
                 )
-                session_transcript.append(
-                    {
-                        "seq": seq,
-                        "source": source_snapshot,
-                        "question_id": qid,
-                        "面试官的问题": question_snapshot,
-                        "AI参考回答": answer,
-                    }
+                if not draft_flag:
+                    session_transcript.append(
+                        {
+                            "seq": seq,
+                            "source": source_snapshot,
+                            "question_id": qid,
+                            "面试官的问题": question_snapshot,
+                            "AI参考回答": display_answer,
+                        }
+                    )
+                await _stream_answer_to_client(
+                    seq, question_snapshot, display_answer, qid
                 )
-                await _stream_answer_to_client(seq, question_snapshot, answer, qid)
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 print(f"[LLM] 生成回答任务异常: {e}")
 
         task = asyncio.create_task(
-            _do_answer(answer_seq, question_text, source, question_id)
+            _do_answer(answer_seq, question_text, source, question_id, is_draft)
         )
         answer_tasks.add(task)
         background_tasks.add(task)
@@ -686,14 +703,9 @@ async def audio_websocket(websocket: WebSocket):
 
         should_close = (
             force
-            or (
-                # 正常沉默关闭：已收到 ASR 句末信号，或文本包含问题信号词
-                silence >= QUESTION_CLOSE_SILENCE_SECONDS
-                and (turn.get("got_final") or is_question_like(turn.get("text", "")))
-            )
             or voiceprint_close  # Fix 4: 声纹换人强制关闭
             or source_takeover_close
-            or silence >= QUESTION_FORCE_CLOSE_SECONDS  # 兜底强制关闭
+            or silence >= 5.0  # 兜底强制关闭，增加超时时间允许长发言
         )
         is_q_like = is_question_like(turn.get("text", ""))
         close_eval = {
@@ -764,8 +776,9 @@ async def audio_websocket(websocket: WebSocket):
             close_check_task.cancel()
 
         async def _watcher():
-            """持续轮询关闭条件，直到 turn 被关闭或取消。"""
+            """持续轮询关闭条件，并在长静默时自动发送草稿。"""
             try:
+                last_draft_text_len = 0
                 while True:
                     await asyncio.sleep(CLOSE_WATCHER_POLL_SECONDS)
                     if not current_turn or current_turn.get("id") != turn_id:
@@ -775,6 +788,34 @@ async def audio_websocket(websocket: WebSocket):
                     closed = await _maybe_close_turn(turn_id, reason="silence")
                     if closed:
                         break
+
+                    # 草稿逻辑
+                    now_ts = time.monotonic()
+                    silence = now_ts - current_turn.get("audio_last_ts", now_ts)
+                    curr_norm = current_turn.get("norm", "")
+                    curr_text_len = len(curr_norm)
+
+                    speaker = current_turn.get("speaker_id")
+                    role = (
+                        speaker_mapping_state.get(speaker, "unknown")
+                        if speaker is not None
+                        else "interviewer"
+                    )
+
+                    # 当是面试官提问，且沉默超过 1.5s，且新增至少 5 个字时触发草稿
+                    if (
+                        role == "interviewer"
+                        and silence >= 1.5
+                        and (curr_text_len - last_draft_text_len) >= 5
+                    ):
+                        last_draft_text_len = curr_text_len
+                        _schedule_answer(
+                            current_turn.get("text", ""),
+                            source="asr_draft",
+                            question_id=turn_id,
+                            is_draft=True,
+                        )
+
             except asyncio.CancelledError:
                 return
 
@@ -886,9 +927,20 @@ async def audio_websocket(websocket: WebSocket):
         # incoming_speaker = _current_dominant_speaker(now_ts)
         # source_role = _current_source_role(now_ts)
 
-        # 1. 摒弃本地音源判定，全量使用云端 speaker_id
+        # 1. 带配置开关的音源识别
         incoming_speaker = getattr(asr_processor, "last_speaker_id", None)
         speaker_name = getattr(asr_processor, "last_speaker_name", None)
+
+        if USE_AUDIO_SOURCE_FOR_ROLE_SEPARATION:
+            # 根据物理音源（声卡 vs 麦克风）强行判定说话人角色
+            dominant = source_activity.get("dominant_source", "unknown")
+            if dominant == "system":
+                speaker_name = "interviewer"
+                # 强行给一个明确的 speaker_id 以保证同角色的气泡不被切分
+                incoming_speaker = "sys_0"
+            elif dominant == "mic":
+                speaker_name = "candidate"
+                incoming_speaker = "mic_1"
 
         if speaker_name in ["interviewer", "candidate"]:
             speaker_mapping_state[incoming_speaker] = speaker_name
@@ -1045,10 +1097,10 @@ async def audio_websocket(websocket: WebSocket):
                 turn_id=current_turn.get("id"),
                 text_preview=(current_turn.get("text", "") or text)[:80],
             )
-            # 听悟虽然判断了句子结束（VAD停顿），业务仍然执行原有的强制关闭触发。
-            # 若后续发现切分过碎可去掉 force=True 让外部任务管理。
+            # 听悟检测到句末（VAD 停顿），标记 got_final，但不再强制立即关题触发回答。
+            # 这样可以在 0.9s 沉默阈值内自然合并多句短句。
             await _maybe_close_turn(
-                current_turn.get("id"), reason="asr_final", force=True
+                current_turn.get("id"), reason="asr_final", force=False
             )
             return
 
@@ -1351,6 +1403,25 @@ async def audio_websocket(websocket: WebSocket):
                             )
                             _schedule_answer(manual_text, "manual", manual_turn_id)
                         continue  # Add continue to prevent falling through
+
+                    elif cmd_json.get("command") == "truncate":
+                        target_qid = cmd_json.get("question_id")
+                        _trace("command_truncate", target_qid=target_qid)
+                        if current_turn and not current_turn.get("closed"):
+                            # 如果指定了 QID 且匹配，或者没有指定且当前活跃，则强制关闭
+                            if (
+                                target_qid is None
+                                or current_turn.get("id") == target_qid
+                            ):
+                                print(
+                                    f"[Manual] User triggered truncate for turn {current_turn.get('id')}"
+                                )
+                                await _maybe_close_turn(
+                                    current_turn.get("id"),
+                                    reason="manual_truncate",
+                                    force=True,
+                                )
+                        continue
 
                 except json.JSONDecodeError:
                     print("[WS] Ignored invalid JSON command.")

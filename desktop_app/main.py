@@ -71,9 +71,12 @@ class DesktopApp:
         self.overlay = OverlayUI()
         self.overlay.show()
 
-        # 绑定浮层界面的信号槽
-        self.overlay.end_session_signal.connect(self.trigger_end_session)  # 结束会话
+        self.overlay.end_session_signal.connect(self.trigger_end_session)  # 结束并复盘
+        self.overlay.close_window_signal.connect(
+            self.close_interview_window
+        )  # 仅关闭窗口
         self.overlay.send_text_signal.connect(self.on_manual_text)  # 手动输入问题
+        self.overlay.truncate_signal.connect(self.on_manual_truncate)  # 手动截断对话
 
         # 启动音频捕获（如果 PyAudio 未安装，则优雅降级）
         if AUDIO_AVAILABLE:  # 先判断PyAudio是否安装（全局常量）
@@ -112,11 +115,19 @@ class DesktopApp:
         self.loop.run_until_complete(self.ws_client())
 
     def trigger_end_session(self):
-        print("[Desktop] 会话结束请求报告...")
+        print("[Desktop] 会话结束并请求复盘报告...")
         if self.overlay:
             self.overlay.update_signal.emit(
                 "answer", "正在请求AI生成面试复盘报告，请稍候..."
             )
+        self._enqueue_ws_payload(b"END_SESSION_CMD")
+
+    def close_interview_window(self):
+        """仅关闭面试界面窗口，停止音频并通知后端，但不等待报告。"""
+        print("[Desktop] 正在请求关闭面试界面窗口...")
+        if self.overlay:
+            self.overlay.hide()
+        # 仍然发送结束信号给后端以停止录音和清理资源
         self._enqueue_ws_payload(b"END_SESSION_CMD")
 
     # 手动输入文本处理
@@ -125,6 +136,13 @@ class DesktopApp:
         # 以 str 类型存入队列，与 bytes 音频数据区分，避免 UTF-8 解码错误
         payload = json.dumps({"command": "manual_question", "text": text})
         self._enqueue_ws_payload(payload)  # str, NOT encoded bytes
+
+    # 手动截断处理
+    def on_manual_truncate(self, question_id: int):
+        """Called when user clicks 'Truncate' on a bubble."""
+        print(f"[Desktop] 手动截断请求: qid={question_id}")
+        payload = json.dumps({"command": "truncate", "question_id": question_id})
+        self._enqueue_ws_payload(payload)
 
     # 语音数据处理
     # audio_bytes：PyAudio 采集到的二进制音频数据（PCM 格式，字节流）
