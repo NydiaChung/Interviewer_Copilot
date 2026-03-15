@@ -1,13 +1,10 @@
 import os
 import pytest
 from unittest.mock import patch, MagicMock
-from server.llm import (
-    get_llm_processor,
-    OpenAIProcessor,
-    DashScopeProcessor,
-    GeminiProcessor,
-    FallbackLLMProcessor,
-)
+from server.llm.fallback import get_llm_processor, FallbackLLMProcessor
+from server.llm.openai_provider import OpenAIProcessor
+from server.llm.dashscope_provider import DashScopeProcessor
+from server.llm.gemini_provider import GeminiProcessor
 
 
 def test_get_llm_processor_factory():
@@ -130,40 +127,29 @@ async def test_gemini_processor_generate_answer():
 # ----------------- Missing Coverage Tests -----------------
 
 
-def test_module_not_found_prompt_import(mocker):
-    import sys
-    from unittest.mock import MagicMock
-
-    dummy_prompt = MagicMock()
-    dummy_prompt.INTERVIEW_PROMPT = "inter"
-    dummy_prompt.OUTLINE_PROMPT = "out"
-    dummy_prompt.ANALYSIS_PROMPT = "ana"
-
-    # Force import error for server.prompt
-    mocker.patch.dict(sys.modules, {"server.prompt": None, "prompt": dummy_prompt})
-    from server import llm
-    import importlib
-
-    importlib.reload(llm)
-
 
 @pytest.mark.asyncio
 async def test_base_llm_processor_not_implemented():
     from server.llm import BaseLLMProcessor
 
     base = BaseLLMProcessor()
+    # Empty inputs return early without calling _call
+    assert await base.generate_outline("", "", "") == ""
+    assert await base.generate_answer("", "", "") == ""
+    assert await base.generate_analysis("", "", "") == "本次面试没有记录下足够的对话，无法进行深入复盘。"
+    # Non-empty inputs trigger _call which raises NotImplementedError
     with pytest.raises(NotImplementedError):
-        await base.generate_outline("", "", "")
+        await base.generate_outline("jd", "resume", "question")
     with pytest.raises(NotImplementedError):
-        await base.generate_answer("", "", "")
+        await base.generate_answer("jd", "resume", "question")
     with pytest.raises(NotImplementedError):
-        await base.generate_analysis("", "", "")
+        await base.generate_analysis("jd", "resume", "history")
 
 
 def test_safe_text_non_str():
-    from server.llm import _safe_text
+    from server.llm.base import safe_text
 
-    assert _safe_text(123) == "123"
+    assert safe_text(123) == "123"
 
 
 def test_processor_init_missing_keys():
@@ -260,7 +246,7 @@ async def test_dashscope_generate_analysis():
             assert await p.generate_analysis("j", "r", "h") == "ds analysis"
 
             mock_resp.status_code = 400
-            assert await p.generate_analysis("j", "r", "h") == "分析生成失败。"
+            assert await p.generate_analysis("j", "r", "h") == ""
 
 
 @pytest.mark.asyncio
@@ -328,7 +314,7 @@ async def test_fallback_processor_methods(mocker):
 
 
 def test_build_processor_and_get_llm_processor(mocker):
-    from server.llm import _build_processor, get_llm_processor, _parse_order
+    from server.llm.fallback import _build_processor, get_llm_processor, _parse_order
 
     # parse order empty/duplicates
     assert _parse_order(" , openai, OpenAI ,") == ["openai"]
@@ -350,9 +336,9 @@ def test_build_processor_and_get_llm_processor(mocker):
         {"OPENAI_API_KEY": "x", "DASHSCOPE_API_KEY": "x", "GEMINI_API_KEY": "x"},
         clear=True,
     ):
-        mocker.patch("server.llm.OpenAIProcessor", side_effect=Exception("e"))
-        mocker.patch("server.llm.DashScopeProcessor", side_effect=Exception("e"))
-        mocker.patch("server.llm.GeminiProcessor", side_effect=Exception("e"))
+        mocker.patch("server.llm.openai_provider.OpenAIProcessor", side_effect=Exception("e"))
+        mocker.patch("server.llm.dashscope_provider.DashScopeProcessor", side_effect=Exception("e"))
+        mocker.patch("server.llm.gemini_provider.GeminiProcessor", side_effect=Exception("e"))
         assert _build_processor("openai") is None
         assert _build_processor("dashscope") is None
         assert _build_processor("gemini") is None
@@ -363,7 +349,7 @@ def test_build_processor_and_get_llm_processor(mocker):
         {"LLM_PROVIDER": "auto", "LLM_AUTO_ORDER": "openai", "OPENAI_API_KEY": "x"},
         clear=True,
     ):
-        mocker.patch("server.llm.OpenAIProcessor")
+        mocker.patch("server.llm.openai_provider.OpenAIProcessor")
         res = get_llm_processor()
         assert res is not None  # returns processor directly
 

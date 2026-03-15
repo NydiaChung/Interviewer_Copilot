@@ -185,15 +185,15 @@ def test_asr_provider_base():
 
 
 def test_doubao_start_missing_keys(mocker):
-    mocker.patch("server.asr.DOUBAO_APP_ID", "")
+    mocker.patch("server.asr.doubao.DOUBAO_APP_ID", "")
     p = DoubaoProvider()
     with pytest.raises(ValueError, match="DOUBAO"):
         p.start()
 
 
 def test_doubao_start_timeout(mocker):
-    mocker.patch("server.asr.DOUBAO_APP_ID", "test")
-    mocker.patch("server.asr.DOUBAO_ACCESS_TOKEN", "test")
+    mocker.patch("server.asr.doubao.DOUBAO_APP_ID", "test")
+    mocker.patch("server.asr.doubao.DOUBAO_ACCESS_TOKEN", "test")
     p = DoubaoProvider()
     # mock event wait to always timeout
     mocker.patch.object(p._ready_event, "wait", return_value=False)
@@ -202,8 +202,8 @@ def test_doubao_start_timeout(mocker):
 
 
 def test_doubao_start_success_and_stop(mocker):
-    mocker.patch("server.asr.DOUBAO_APP_ID", "test")
-    mocker.patch("server.asr.DOUBAO_ACCESS_TOKEN", "test")
+    mocker.patch("server.asr.doubao.DOUBAO_APP_ID", "test")
+    mocker.patch("server.asr.doubao.DOUBAO_ACCESS_TOKEN", "test")
     p = DoubaoProvider()
 
     # Mock thread start to just immediately set ready event so it doesn't hang
@@ -271,7 +271,7 @@ from server.asr import TingwuProvider
 
 
 def test_tingwu_start_missing_keys(mocker):
-    mocker.patch("server.asr.ALIYUN_AK_ID", "")
+    mocker.patch("server.asr.tingwu.ALIYUN_AK_ID", "")
     p = TingwuProvider()
     with pytest.raises(ValueError):
         p.start()
@@ -365,31 +365,28 @@ def test_tingwu_create_and_stop_task(mocker):
 
 def test_tingwu_callbacks():
     p = TingwuProvider()
-    p.on_text_update = MagicMock()
+    p.on_text_update = AsyncMock()
     p.loop = asyncio.new_event_loop()
 
     # start
     p._on_start("msg")
     assert p._ready_event.is_set()
 
-    # phrase begin
+    # phrase begin — now takes dict, not JSON string
     p._on_sentence_begin(
-        json.dumps({"payload": {"speaker_id": "spk1", "speaker_name": "Speaker1"}})
+        {"payload": {"speaker_id": "spk1", "speaker_name": "Speaker1"}}
     )
     assert p.last_speaker_id == "spk1"
     assert p.last_speaker_name == "Speaker1"
 
     # result changed
-    p._on_result_changed(json.dumps({"payload": {"result": "txt"}}))
+    p._on_result_changed({"payload": {"result": "txt"}})
 
     # sentence end
-    p._on_sentence_end(json.dumps({"payload": {"result": "txt"}}))
+    p._on_sentence_end({"payload": {"result": "txt"}})
 
     # completed
     p._on_completed("msg")
 
     # error
     p._on_error("err")
-
-    # close
-    p._on_close()

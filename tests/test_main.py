@@ -5,7 +5,8 @@ import base64
 import os
 import io
 
-from server.main import app, _normalize_text, _similarity, _chunk_answer_text
+from server.main import app
+from server.utils.text import normalize_text as _normalize_text, text_similarity as _similarity, chunk_answer_text as _chunk_answer_text
 
 client = TestClient(app)
 
@@ -54,11 +55,12 @@ def test_set_context():
         },
     )
     assert response.status_code == 200
-    from server import main as main_module
+    from server.handlers.ws_handler import get_default_session
 
-    assert main_module.JD_TEXT == "Software Engineer"
-    assert "【个人简历】" in main_module.RESUME_TEXT
-    assert "【其他补充信息】" in main_module.RESUME_TEXT
+    session = get_default_session()
+    assert session.jd_text == "Software Engineer"
+    assert "【个人简历】" in session.resume_text
+    assert "【其他补充信息】" in session.resume_text
 
 
 def test_parse_resume_image():

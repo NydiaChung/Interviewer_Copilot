@@ -1,4 +1,5 @@
-from server.intent import IntentReadinessDetector, is_question_like
+from server.conversation.intent_detector import IntentReadinessDetector
+from server.conversation.turn_rules import is_question_like
 
 
 def test_intent_trigger_on_clear_question():
@@ -67,8 +68,8 @@ def test_intent_should_trigger_outline_short_text():
 
 
 def test_similarity_empty():
-    from server.intent import _similarity
+    from server.utils.text import text_similarity
 
-    assert _similarity("", "abc") == 0.0
-    assert _similarity("abc", "") == 0.0
-    assert _similarity(None, "abc") == 0.0
+    assert text_similarity("", "abc") == 0.0
+    assert text_similarity("abc", "") == 0.0
+    assert text_similarity(None, "abc") == 0.0

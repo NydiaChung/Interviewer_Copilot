@@ -8,7 +8,7 @@ import inspect
 from unittest.mock import patch, MagicMock
 from fastapi.testclient import TestClient
 
-# 设置环境变量，防止 main.py 在启动时因为缺少 Key 而崩溃
+# 设置环境变量，防止启动时因为缺少 Key 而崩溃
 os.environ["OPENAI_API_KEY"] = "dummy"
 os.environ["DASHSCOPE_API_KEY"] = "dummy"
 os.environ["GEMINI_API_KEY"] = "dummy"
@@ -36,23 +36,21 @@ def test_set_context():
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
 
-    # 验证全局变量是否已更新 (由于 main.py 在同一个进程通过 global 变量管理，这里可以直接测试)
-    from server import main
+    from server.handlers.ws_handler import get_default_session
 
-    assert main.JD_TEXT == "Software Engineer JD"
-    assert "Experienced Developer Resume" in main.RESUME_TEXT
-    assert "Supplemental data" in main.RESUME_TEXT
+    session = get_default_session()
+    assert session.jd_text == "Software Engineer JD"
+    assert "Experienced Developer Resume" in session.resume_text
+    assert "Supplemental data" in session.resume_text
 
 
 def test_parse_resume_pdf_mock():
-    # 模拟 fitz (PyMuPDF)
     mock_doc = MagicMock()
     mock_page = MagicMock()
     mock_page.get_text.return_value = "Extracted PDF Text"
     mock_doc.__iter__.return_value = [mock_page]
 
     with patch("fitz.open", return_value=mock_doc):
-        # 创建一个假的 PDF 文件内容
         file_content = b"%PDF-1.4 dummy content"
         files = {"file": ("resume.pdf", file_content, "application/pdf")}
         response = client.post("/parse_resume", files=files)
@@ -62,7 +60,6 @@ def test_parse_resume_pdf_mock():
 
 
 def test_parse_resume_docx_mock():
-    # 模拟 docx.Document
     mock_doc = MagicMock()
     mock_para = MagicMock()
     mock_para.text = "Extracted Docx Paragraph"
@@ -166,19 +163,32 @@ class _FailingLLM(_FakeLLM):
         raise RuntimeError("analysis failed")
 
 
-def test_manual_question_does_not_trigger_analysis():
-    from server import main
+def _patch_llm_and_asr(fake_llm, fake_asr_or_factory):
+    """Helper to patch llm_processor and get_asr_processor in their actual modules."""
+    import server.handlers.command_handler as cmd_mod
+    import server.handlers.answer_scheduler as ans_mod
+    import server.handlers.ws_handler as ws_mod
 
+    if callable(fake_asr_or_factory) and not isinstance(fake_asr_or_factory, _FakeASR):
+        asr_patch = patch.object(ws_mod, "get_asr_processor", side_effect=fake_asr_or_factory)
+    else:
+        asr_patch = patch.object(ws_mod, "get_asr_processor", return_value=fake_asr_or_factory)
+
+    return (
+        patch.object(cmd_mod, "llm_processor", fake_llm),
+        patch.object(ans_mod, "llm_processor", fake_llm),
+        asr_patch,
+    )
+
+
+def test_manual_question_does_not_trigger_analysis():
     fake_llm = _FakeLLM()
-    with patch.object(main, "llm_processor", fake_llm), patch.object(
-        main, "get_asr_processor", return_value=_FakeASR()
-    ):
+    p1, p2, p3 = _patch_llm_and_asr(fake_llm, _FakeASR())
+    with p1, p2, p3:
         with client.websocket_connect("/ws/audio") as ws:
             ws.send_text(json.dumps({"command": "manual_question", "text": "你好"}))
-            # 内部新增了一条回显的 incremental 消息
             incremental = ws.receive_json()
             assert incremental["type"] == "incremental"
-            # 验证真正的回答
             response = ws.receive_json()
             assert response["type"] == "answer"
             assert response["answer"] == "answer:你好"
@@ -188,12 +198,9 @@ def test_manual_question_does_not_trigger_analysis():
 
 
 def test_end_session_triggers_analysis():
-    from server import main
-
     fake_llm = _FakeLLM()
-    with patch.object(main, "llm_processor", fake_llm), patch.object(
-        main, "get_asr_processor", return_value=_FakeASR()
-    ):
+    p1, p2, p3 = _patch_llm_and_asr(fake_llm, _FakeASR())
+    with p1, p2, p3:
         with client.websocket_connect("/ws/audio") as ws:
             ws.send_text(json.dumps({"command": "end_session"}))
             response = ws.receive_json()
@@ -204,8 +211,6 @@ def test_end_session_triggers_analysis():
 
 
 def test_websocket_uses_per_connection_asr_instance():
-    from server import main
-
     fake_llm = _FakeLLM()
     factory_calls = []
 
@@ -213,9 +218,8 @@ def test_websocket_uses_per_connection_asr_instance():
         factory_calls.append(1)
         return _FakeASR()
 
-    with patch.object(main, "llm_processor", fake_llm), patch.object(
-        main, "get_asr_processor", side_effect=_factory
-    ):
+    p1, p2, p3 = _patch_llm_and_asr(fake_llm, _factory)
+    with p1, p2, p3:
         with client.websocket_connect("/ws/audio") as ws1:
             ws1.send_text(json.dumps({"command": "end_session"}))
             ws1.receive_json()
@@ -227,30 +231,22 @@ def test_websocket_uses_per_connection_asr_instance():
 
 
 def test_manual_question_returns_fallback_when_llm_fails():
-    from server import main
-
     failing_llm = _FailingLLM()
-    with patch.object(main, "llm_processor", failing_llm), patch.object(
-        main, "get_asr_processor", return_value=_FakeASR()
-    ):
+    p1, p2, p3 = _patch_llm_and_asr(failing_llm, _FakeASR())
+    with p1, p2, p3:
         with client.websocket_connect("/ws/audio") as ws:
             ws.send_text(json.dumps({"command": "manual_question", "text": "你好"}))
-            # 内部新增了一条回显的 incremental 消息
             incremental = ws.receive_json()
             assert incremental["type"] == "incremental"
-            # 验证真正的回答
             response = ws.receive_json()
             assert response["type"] == "answer"
             assert "抱歉，我刚才没来得及生成完整回答" in response["answer"]
 
 
 def test_end_session_returns_fallback_when_analysis_fails():
-    from server import main
-
     failing_llm = _FailingLLM()
-    with patch.object(main, "llm_processor", failing_llm), patch.object(
-        main, "get_asr_processor", return_value=_FakeASR()
-    ):
+    p1, p2, p3 = _patch_llm_and_asr(failing_llm, _FakeASR())
+    with p1, p2, p3:
         with client.websocket_connect("/ws/audio") as ws:
             ws.send_text(json.dumps({"command": "end_session"}))
             response = ws.receive_json()
@@ -260,8 +256,6 @@ def test_end_session_returns_fallback_when_analysis_fails():
 
 def test_dual_stream_text_audio_frame_is_forwarded_to_asr():
     """双流模式下桌面端会发送 text(JSON+base64) 音频帧，后端也应转发给 ASR。"""
-    from server import main
-
     fake_asr = _RecordingASR()
     fake_llm = _FakeLLM()
     raw = b"\x01\x02\x03\x04\x05\x06\x07\x08"
@@ -271,9 +265,8 @@ def test_dual_stream_text_audio_frame_is_forwarded_to_asr():
         "data": base64.b64encode(raw).decode("ascii"),
     }
 
-    with patch.object(main, "llm_processor", fake_llm), patch.object(
-        main, "get_asr_processor", return_value=fake_asr
-    ):
+    p1, p2, p3 = _patch_llm_and_asr(fake_llm, fake_asr)
+    with p1, p2, p3:
         with client.websocket_connect("/ws/audio") as ws:
             ws.send_text(json.dumps(audio_payload))
             ws.send_text(json.dumps({"command": "end_session"}))
@@ -285,8 +278,6 @@ def test_dual_stream_text_audio_frame_is_forwarded_to_asr():
 
 
 def test_candidate_channel_callback_is_async_and_emits_incremental():
-    from server import main
-
     main_asr = _RecordingASR()
     candidate_asr = _TriggeringASR(trigger_text="候选人：您好，我先做个自我介绍。")
     fake_llm = _FakeLLM()
@@ -301,9 +292,8 @@ def test_candidate_channel_callback_is_async_and_emits_incremental():
     def _factory():
         return providers.pop(0)
 
-    with patch.object(main, "llm_processor", fake_llm), patch.object(
-        main, "get_asr_processor", side_effect=_factory
-    ):
+    p1, p2, p3 = _patch_llm_and_asr(fake_llm, _factory)
+    with p1, p2, p3:
         with client.websocket_connect("/ws/audio") as ws:
             ws.send_text(json.dumps(audio_payload))
             incremental = ws.receive_json()
@@ -323,12 +313,9 @@ def test_candidate_channel_callback_is_async_and_emits_incremental():
 
 
 def test_websocket_keeps_alive_when_asr_start_fails():
-    from server import main
-
     fake_llm = _FakeLLM()
-    with patch.object(main, "llm_processor", fake_llm), patch.object(
-        main, "get_asr_processor", return_value=_FailStartASR()
-    ):
+    p1, p2, p3 = _patch_llm_and_asr(fake_llm, _FailStartASR())
+    with p1, p2, p3:
         with client.websocket_connect("/ws/audio") as ws:
             warning = ws.receive_json()
             assert warning["type"] == "incremental"

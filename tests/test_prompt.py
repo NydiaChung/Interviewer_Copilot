@@ -1,4 +1,4 @@
-from server.prompt import INTERVIEW_PROMPT, OUTLINE_PROMPT, ANALYSIS_PROMPT
+from server.prompts import INTERVIEW_PROMPT, OUTLINE_PROMPT, ANALYSIS_PROMPT
 
 
 def test_interview_prompt_format():

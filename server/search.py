@@ -1,4 +1,4 @@
-"""Search module using Tavily."""
+"""搜索模块 — 基于 Tavily 的网络搜索。"""
 
 import os
 from tavily import TavilyClient
@@ -7,17 +7,17 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 
 class SearchProcessor:
-    """Tavily search processor for web context."""
+    """Tavily 网络搜索处理器。"""
 
     def __init__(self):
         if not TAVILY_API_KEY:
-            # We don't want to crash if it's not set, just disable search.
+            # 未配置 Key 时不崩溃，仅禁用搜索功能
             self.client = None
         else:
             self.client = TavilyClient(api_key=TAVILY_API_KEY)
 
     def search(self, query: str, max_results: int = 3) -> str:
-        """Perform a web search and return a built context string."""
+        """执行网络搜索，返回拼接后的上下文文本。"""
         if not self.client or not query.strip():
             return ""
 
@@ -26,7 +26,7 @@ class SearchProcessor:
                 query=query, search_depth="advanced", max_results=max_results
             )
 
-            # Format the results into a context string
+            # 将搜索结果格式化为上下文字符串
             context_pieces = []
             for result in response.get("results", []):
                 snippet = result.get("content", "")
@@ -39,5 +39,5 @@ class SearchProcessor:
             return ""
 
 
-# Singleton instance
+# 单例
 search_processor = SearchProcessor()
