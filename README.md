@@ -50,12 +50,20 @@ uvicorn main:app --reload --port 8000
 
 ```
 interview-copilot/
-├── server/
-│   ├── main.py         # FastAPI 主应用
-│   ├── asr.py          # 语音识别模块
-│   ├── llm.py          # LLM 回答生成
-│   ├── prompt.py       # 提示词模板
-│   └── requirements.txt
+  server/
+  ├── main.py                  # 入口：创建 App + 注册路由
+  ├── config.py                # 配置常量
+  ├── voiceprint.py            # 领域服务：声纹追踪
+  ├── search.py                # 领域服务：网络搜索
+  ├── asr/                     # 领域服务：语音识别
+  ├── llm/                     # 领域服务：大模型调用
+  ├── conversation/            # 领域服务：轮次管理
+  ├── models/                  # 数据模型
+  ├── handlers/                # 请求/事件处理（协调层）
+  ├── prompts/                 # Prompt 模板
+  └── utils/                   # 纯工具函数（无状态、无业务）
+
+
 │
 ├── extension/
 │   ├── manifest.json   # 插件配置
@@ -69,11 +77,11 @@ interview-copilot/
 
 ## 性能指标
 
-| 项目 | 目标 |
-|------|------|
+| 项目     | 目标 |
+| -------- | ---- |
 | ASR 延迟 | < 2s |
 | 答案生成 | < 3s |
-| 总延迟 | < 5s |
+| 总延迟   | < 5s |
 
 ## 注意事项
 
