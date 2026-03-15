@@ -7,7 +7,6 @@ import time
 from typing import TYPE_CHECKING
 
 from server.config import USE_AUDIO_SOURCE_FOR_ROLE_SEPARATION
-from server.conversation.turn_rules import is_question_like
 from server.utils.text import normalize_text
 
 if TYPE_CHECKING:
@@ -27,6 +26,23 @@ def _extract_increment(full_text: str, baseline: str) -> str:
     return parts[-1] if parts else ft
 
 
+def _resolve_source_role(ctx: ConnectionState, incoming_speaker) -> str:
+    """根据音源确定说话人角色：系统音频=interviewer，麦克风=candidate。"""
+    if USE_AUDIO_SOURCE_FOR_ROLE_SEPARATION:
+        dominant = ctx.source_activity.get("dominant_source", "unknown")
+        if dominant == "system":
+            return "interviewer"
+        if dominant == "mic":
+            return "candidate"
+
+    # 回退：ASR 自带的说话人名
+    speaker_name = getattr(ctx.asr_processor, "last_speaker_name", None)
+    if speaker_name in ("interviewer", "candidate"):
+        return speaker_name
+
+    return ctx.speaker_mapping_state.get(incoming_speaker, "interviewer")
+
+
 def build_text_callback(ctx: ConnectionState):
     """构造主 ASR 回调闭包。"""
 
@@ -42,26 +58,8 @@ def build_text_callback(ctx: ConnectionState):
         ctx.main_active_frames_since_text = 0
         normalized = normalize_text(text)
 
-        # 说话人识别
         incoming_speaker = getattr(ctx.asr_processor, "last_speaker_id", None)
-        speaker_name = getattr(ctx.asr_processor, "last_speaker_name", None)
-
-        if USE_AUDIO_SOURCE_FOR_ROLE_SEPARATION:
-            dominant = ctx.source_activity.get("dominant_source", "unknown")
-            if dominant == "system":
-                speaker_name = "interviewer"
-                incoming_speaker = "sys_0"
-            elif dominant == "mic":
-                speaker_name = "candidate"
-                incoming_speaker = "mic_1"
-
-        if speaker_name in ("interviewer", "candidate"):
-            ctx.speaker_mapping_state[incoming_speaker] = speaker_name
-            source_role = speaker_name
-        else:
-            source_role = ctx.speaker_mapping_state.get(
-                incoming_speaker, "interviewer"
-            )
+        source_role = _resolve_source_role(ctx, incoming_speaker)
 
         current_turn = ctx.turn_manager.current_turn
 
@@ -71,28 +69,16 @@ def build_text_callback(ctx: ConnectionState):
                 current_turn.get("id") if current_turn else None
             ),
             is_sentence_end=bool(is_sentence_end),
-            speaker_id=incoming_speaker,
             source_role=source_role,
             text_preview=text[:80],
-            text_len=len(normalized),
         )
 
-        # 候选人说话 → 只做字幕展示
-        if source_role == "candidate":
-            await _handle_candidate_speech(
-                ctx, text, current_turn, incoming_speaker, now_ts, is_sentence_end
-            )
-            return
-
-        # 面试官说话 → 轮次管理
+        # 判断是否需要开新气泡（音源切换）
         from server.handlers.turn_closer import maybe_close_turn, arm_close_check
         from server.handlers.answer_scheduler import generate_outline
 
         if current_turn and ctx.turn_manager.check_should_start_new_turn(
-            normalized,
-            incoming_speaker,
-            source_role,
-            asr_got_final=is_sentence_end,
+            source_role
         ):
             ctx.trace(
                 "new_turn_detected",
@@ -102,27 +88,30 @@ def build_text_callback(ctx: ConnectionState):
             await maybe_close_turn(
                 ctx,
                 current_turn.get("id"),
-                reason="next_question_start",
+                reason="source_switch",
                 force=True,
             )
             current_turn = None
-        elif current_turn:
-            ctx.trace(
-                "new_turn_not_detected",
-                prev_turn_id=current_turn.get("id"),
-                **ctx.turn_manager.last_new_turn_eval,
-            )
 
-        # 创建或更新 turn
+        # 候选人说话 → 只做字幕，不触发 LLM
+        if source_role == "candidate":
+            await _handle_candidate_speech(
+                ctx, text, current_turn, incoming_speaker,
+                source_role, now_ts, is_sentence_end,
+            )
+            return
+
+        # 面试官说话 → 轮次管理 + LLM
         if not current_turn:
             current_turn = ctx.turn_manager.create_turn(
                 text, normalized, incoming_speaker,
+                source_role=source_role,
                 asr_baseline=ctx.asr_global_text,
             )
             ctx.trace(
                 "turn_created",
                 turn_id=current_turn.get("id"),
-                speaker_id=current_turn.get("speaker_id"),
+                source_role=source_role,
                 text_preview=text[:80],
             )
         else:
@@ -130,16 +119,6 @@ def build_text_callback(ctx: ConnectionState):
             increment_text = _extract_increment(text, baseline)
             increment_norm = normalize_text(increment_text)
             ctx.turn_manager.update_turn_text(increment_text, increment_norm)
-            if (
-                current_turn.get("speaker_id") is None
-                and incoming_speaker is not None
-            ):
-                current_turn["speaker_id"] = incoming_speaker
-
-        # 归一化增量文本
-        baseline_now = current_turn.get("asr_baseline", "")
-        inc_text_now = _extract_increment(text, baseline_now)
-        normalized = normalize_text(inc_text_now) or normalized
 
         # 发送增量到前端
         try:
@@ -153,24 +132,12 @@ def build_text_callback(ctx: ConnectionState):
                     "trace_id": ctx.trace_id,
                 }
             )
-            ctx.trace(
-                "ws_incremental_sent",
-                stream="main",
-                speaker_role=source_role,
-                question_id=current_turn.get("id"),
-                text_preview=(current_turn.get("text", "") or text)[:80],
-            )
         except Exception:
             pass
 
         # 句末处理
         if is_sentence_end:
             current_turn["got_final"] = True
-            ctx.trace(
-                "asr_sentence_end",
-                turn_id=current_turn.get("id"),
-                text_preview=(current_turn.get("text", "") or text)[:80],
-            )
             await maybe_close_turn(
                 ctx,
                 current_turn.get("id"),
@@ -185,16 +152,9 @@ def build_text_callback(ctx: ConnectionState):
             and not is_sentence_end
             and ctx.intent_detector.should_trigger_outline(text)
         ):
-            print("[LLM] Intent ready. Generating draft outline...")
             ctx.turn_manager.mark_drafting()
             turn_id = current_turn.get("id")
             outline_seq = ctx.next_answer_seq
-            ctx.trace(
-                "outline_triggered",
-                turn_id=turn_id,
-                seq=outline_seq,
-                text_preview=text[:80],
-            )
 
             if ctx.outline_task and not ctx.outline_task.done():
                 ctx.outline_task.cancel()
@@ -215,67 +175,60 @@ async def _handle_candidate_speech(
     text: str,
     current_turn: dict | None,
     incoming_speaker,
+    source_role: str,
     now_ts: float,
     is_sentence_end: bool,
 ):
-    """候选人发言：字幕展示 + 可能触发关闭当前面试官轮次。"""
-    from server.handlers.turn_closer import maybe_close_turn
+    """候选人发言：创建/更新候选人气泡，不触发 LLM。"""
+    normalized = normalize_text(text)
 
-    candidate_text = text
-    if current_turn:
+    # 没有当前轮或当前轮不是候选人 → 创建新的候选人气泡
+    if not current_turn:
+        current_turn = ctx.turn_manager.create_turn(
+            text, normalized, incoming_speaker,
+            source_role=source_role,
+            asr_baseline=ctx.asr_global_text,
+        )
+    else:
         baseline = current_turn.get("asr_baseline", "")
-        candidate_text = _extract_increment(text, baseline) or text
+        increment_text = _extract_increment(text, baseline)
+        increment_norm = normalize_text(increment_text)
+        ctx.turn_manager.update_turn_text(increment_text, increment_norm)
 
     try:
         await ctx.websocket.send_json(
             {
                 "type": "incremental",
-                "text": candidate_text,
-                "question_id": (
-                    current_turn.get("id") if current_turn else None
-                ),
+                "text": current_turn.get("text", "") or text,
+                "question_id": current_turn.get("id"),
                 "speaker_id": incoming_speaker,
                 "speaker_role": "candidate",
                 "trace_id": ctx.trace_id,
             }
         )
-        ctx.trace(
-            "ws_incremental_sent",
-            stream="main",
-            speaker_role="candidate",
-            question_id=(
-                current_turn.get("id") if current_turn else None
-            ),
-            text_preview=(candidate_text or text)[:80],
-        )
     except Exception:
         pass
 
-    if current_turn and not current_turn.get("closed"):
-        force_close = bool(
-            current_turn.get("got_final")
-            or is_question_like(current_turn.get("text", ""))
-            or (now_ts - current_turn.get("text_last_ts", now_ts) > 0.8)
-        )
-        await maybe_close_turn(
-            ctx,
-            current_turn.get("id"),
-            reason="candidate_takeover",
-            force=force_close,
+    # 候选人句末 → 记录到 transcript
+    if is_sentence_end:
+        ctx.session_transcript.append(
+            {
+                "seq": len(ctx.session_transcript) + 1,
+                "source": "candidate",
+                "question_id": current_turn.get("id"),
+                "候选人回答": current_turn.get("text", "") or text,
+            }
         )
 
 
 def build_candidate_callback(ctx: ConnectionState):
-    """构造候选人专用 ASR 回调闭包。"""
+    """构造候选人专用 ASR 回调闭包（双通道模式）。"""
 
     async def on_candidate_text_update(text: str, is_sentence_end: bool):
         if not text:
             return
 
-        print(
-            f"[Callback-Candidate] Received: {text} "
-            f"(is_end={is_sentence_end})"
-        )
+        print(f"[Callback-Candidate] Received: {text} (is_end={is_sentence_end})")
 
         await ctx.websocket.send_json(
             {
@@ -287,23 +240,13 @@ def build_candidate_callback(ctx: ConnectionState):
                 "trace_id": f"{ctx.trace_id}-cand",
             }
         )
-        ctx.trace(
-            "ws_incremental_sent",
-            stream="candidate",
-            speaker_role="candidate",
-            question_id=-1,
-            text_preview=text[:80],
-        )
 
         if is_sentence_end:
-            print(f"[Candidate-ASR] Final: {text}")
             ctx.session_transcript.append(
                 {
                     "seq": len(ctx.session_transcript) + 1,
                     "source": "candidate_channel",
                     "question_id": -1,
-                    "面试官的问题": "",
-                    "AI参考回答": "",
                     "候选人回答": text,
                 }
             )

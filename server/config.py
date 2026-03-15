@@ -24,23 +24,6 @@ QUESTION_CLOSE_SILENCE_SECONDS = 0.9
 QUESTION_FORCE_CLOSE_SECONDS = 2.6
 
 # ---------------------------------------------------------------------------
-# 轮次切换判断阈值
-# ---------------------------------------------------------------------------
-NEW_QUESTION_SIMILARITY_THRESHOLD = 0.45
-VOICEPRINT_SWITCH_MIN_GAP_SECONDS = 0.35
-VOICEPRINT_SWITCH_SIMILARITY_THRESHOLD = 0.72
-
-# 停顿时间阈值（秒）— 用于 turn_rules
-QUESTION_PAUSE_SHORT_THRESHOLD = 0.22
-QUESTION_PAUSE_MID_THRESHOLD = 0.4
-QUESTION_PAUSE_LONG_THRESHOLD = 0.55
-
-# 短文本阈值
-SHORT_TEXT_MIN_PREV = 10
-SHORT_TEXT_MIN_INCOMING = 6
-SHORT_TEXT_MIN_INCOMING_SWITCH = 4
-
-# ---------------------------------------------------------------------------
 # 声纹
 # ---------------------------------------------------------------------------
 VOICEPRINT_CLOSE_SILENCE_SECONDS = 0.35
